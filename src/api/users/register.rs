@@ -128,10 +128,10 @@ pub async fn register(
         }
 
         if let (Some(reserved_email), Some(reserved_at)) = (reserved_email.as_deref(), reserved_at)
+            && reserved_at >= now - 600
+            && reserved_email != p.email
         {
-            if reserved_at >= now - 600 && reserved_email != p.email {
-                return Err((StatusCode::CONFLICT, "Access token already reserved"));
-            }
+            return Err((StatusCode::CONFLICT, "Access token already reserved"));
         }
 
         sqlx::query(

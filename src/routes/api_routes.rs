@@ -4,12 +4,14 @@ use axum::http::StatusCode;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    routing::{get, patch, post, put},
+    routing::{get, patch, post},
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use crate::api::{company, contracts, lots, projects, users};
+
+const BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
 async fn keepalive(Extension(pool): Extension<PgPool>) -> (StatusCode, Json<Value>) {
     match sqlx::query("SELECT 1").execute(&pool).await {
@@ -25,8 +27,8 @@ async fn keepalive(Extension(pool): Extension<PgPool>) -> (StatusCode, Json<Valu
 }
 
 pub fn routes() -> Router {
-    // All other routes — auth, session, enquiry reads/updates — capped at 5 MB
-    let core_routes = Router::new()
+    // Auth & session routes — capped at 10 MB
+    let auth_routes = Router::new()
         .route("/keepalive", get(keepalive))
         .route("/auth/register", post(users::register))
         .route("/auth/verify", post(users::verify))
@@ -42,6 +44,10 @@ pub fn routes() -> Router {
             "/auth/password-reset/confirm",
             post(users::password_reset_confirm),
         )
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES));
+
+    // Company, project, lot, and contract data routes — capped at 10 MB
+    let data_routes = Router::new()
         .route(
             "/company/settings",
             get(company::get_settings).patch(company::update_settings),
@@ -71,8 +77,8 @@ pub fn routes() -> Router {
         .route(
             "/contracts/{id}/payments",
             post(contracts::record_payment),
-        );
+        )
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES));
 
-    Router::new()
-        .merge(core_routes)
+    Router::new().merge(auth_routes).merge(data_routes)
 }

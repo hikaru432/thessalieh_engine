@@ -483,10 +483,10 @@ pub async fn update_contract(
         return Err((StatusCode::NOT_FOUND, "Contract not found"));
     }
 
-    if previous_lot_id != p.lot_id {
-        if let Some(old_lot_id) = previous_lot_id {
-            clear_lot(&pool, old_lot_id).await?;
-        }
+    if previous_lot_id != p.lot_id
+        && let Some(old_lot_id) = previous_lot_id
+    {
+        clear_lot(&pool, old_lot_id).await?;
     }
     if let Some(lot_id) = p.lot_id {
         sync_lot_for_contract(&pool, lot_id, p.buyer_name.trim(), &p.payment_plan, false).await?;

@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 pub type E = (StatusCode, &'static str);
 
-pub const SESSION_MAX_AGE: i64 = 1 * 24 * 3600; // 1 day
+pub const SESSION_MAX_AGE: i64 = 24 * 3600; // 1 day
 
 #[derive(Serialize)]
 pub struct UserResponse {
