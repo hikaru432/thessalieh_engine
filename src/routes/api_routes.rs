@@ -9,7 +9,7 @@ use axum::{
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use crate::api::{company, projects, users};
+use crate::api::{company, lots, projects, users};
 
 async fn keepalive(Extension(pool): Extension<PgPool>) -> (StatusCode, Json<Value>) {
     match sqlx::query("SELECT 1").execute(&pool).await {
@@ -49,6 +49,14 @@ pub fn routes() -> Router {
         .route(
             "/projects",
             get(projects::list_projects).post(projects::create_project),
+        )
+        .route(
+            "/projects/{project_id}/lots",
+            get(lots::list_lots).post(lots::create_lot),
+        )
+        .route(
+            "/lots/{id}",
+            patch(lots::update_lot).delete(lots::delete_lot),
         );
 
     Router::new()
