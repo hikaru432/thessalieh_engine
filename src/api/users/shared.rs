@@ -87,6 +87,14 @@ pub fn is_valid_email(email: &str) -> bool {
     parts.len() == 2 && !parts[0].is_empty() && parts[1].contains('.') && parts[1].len() > 2
 }
 
+pub fn is_valid_username(username: &str) -> bool {
+    let len = username.chars().count();
+    (3..=255).contains(&len)
+        && username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
 pub fn is_strong_password(pw: &str) -> bool {
     pw.len() >= 8
         && pw.chars().any(|c| c.is_uppercase())

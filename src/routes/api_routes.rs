@@ -31,7 +31,6 @@ pub fn routes() -> Router {
     let auth_routes = Router::new()
         .route("/keepalive", get(keepalive))
         .route("/auth/register", post(users::register))
-        .route("/auth/verify", post(users::verify))
         .route("/auth/login", post(users::login))
         .route("/auth/session", get(users::session_handler))
         .route("/auth/logout", post(users::logout))

@@ -2,20 +2,24 @@ use argon2::{
     Algorithm, Argon2, Params, PasswordHasher, Version,
     password_hash::{SaltString, rand_core::OsRng},
 };
-use axum::{Extension, Json, http::StatusCode};
+use axum::{
+    Extension, Json,
+    http::{HeaderMap, HeaderValue, StatusCode, header::SET_COOKIE},
+};
 use chrono::Utc;
-use rand::RngExt;
 use serde::Deserialize;
 use sqlx::PgPool;
+use uuid::Uuid;
 
-use super::shared::{E, MessageResponse, is_strong_password, is_valid_email};
-use crate::api::mailer;
+use super::shared::{
+    E, SESSION_MAX_AGE, UserResponse, csrf_cookie, is_strong_password, is_valid_username,
+    new_csrf_token, session_cookie,
+};
 use crate::api::verified::Verified;
 
 #[derive(Deserialize)]
 struct RegisterInput {
-    name: String,
-    email: String,
+    username: String,
     password: String,
     access_token: String,
 }
@@ -23,18 +27,13 @@ struct RegisterInput {
 pub async fn register(
     Extension(pool): Extension<PgPool>,
     Verified(msg, _): Verified,
-) -> Result<(StatusCode, Json<MessageResponse>), E> {
+) -> Result<(StatusCode, HeaderMap, Json<UserResponse>), E> {
     let p: RegisterInput = serde_json::from_slice(&msg)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid payload JSON"))?;
 
-    if !is_valid_email(&p.email) {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "Invalid email"));
-    }
-    if p.name.is_empty() || p.name.len() > 255 {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "Name too long"));
-    }
-    if p.email.len() > 255 {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "Email too long"));
+    let username = p.username.trim().to_string();
+    if !is_valid_username(&username) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "Invalid username"));
     }
     if !is_strong_password(&p.password) {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "Password too weak"));
@@ -55,16 +54,14 @@ pub async fn register(
         .hash_password(p.password.as_bytes(), &salt)
         .unwrap()
         .to_string();
-    let code = format!("{:06}", rand::rng().random_range(0..1_000_000u32));
-    let expires_at = now + 600;
 
     let mut tx = pool.begin().await.map_err(|e| {
         tracing::error!("DB: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "Registration failed")
     })?;
 
-    if sqlx::query("SELECT id FROM public.users WHERE email = $1")
-        .bind(&p.email)
+    if sqlx::query("SELECT id FROM public.users WHERE username = $1")
+        .bind(&username)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| {
@@ -73,24 +70,20 @@ pub async fn register(
         })?
         .is_some()
     {
-        tracing::warn!(email = %p.email, "register failed: email already exists");
+        tracing::warn!(%username, "register failed: username already exists");
         return Err((StatusCode::CONFLICT, "Registration failed"));
     }
 
-    let access_token_opt: Option<String> = if access_token.is_empty() {
-        None
+    let role = if access_token.is_empty() {
+        "User"
     } else {
-        Some(access_token.clone())
-    };
-
-    if let Some(ref token) = access_token_opt {
         let token_row = sqlx::query(
-            "SELECT token, reserved_email, reserved_at, redeemed_at, revoked_at
+            "SELECT redeemed_at, revoked_at, expires_at
                FROM public.access_tokens
               WHERE token = $1
               FOR UPDATE",
         )
-        .bind(token)
+        .bind(&access_token)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| {
@@ -102,8 +95,7 @@ pub async fn register(
         use sqlx::Row;
         let revoked_at: Option<i64> = token_row.try_get("revoked_at").ok().flatten();
         let redeemed_at: Option<i64> = token_row.try_get("redeemed_at").ok().flatten();
-        let reserved_email: Option<String> = token_row.try_get("reserved_email").ok().flatten();
-        let reserved_at: Option<i64> = token_row.try_get("reserved_at").ok().flatten();
+        let expires_at: Option<i64> = token_row.try_get("expires_at").ok().flatten();
 
         if revoked_at.is_some() {
             return Err((StatusCode::UNPROCESSABLE_ENTITY, "Invalid access token"));
@@ -114,34 +106,39 @@ pub async fn register(
                 "Access token already used",
             ));
         }
-
-        let token_expires: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT expires_at FROM public.access_tokens WHERE token = $1",
-        )
-        .bind(token)
-        .fetch_one(&mut *tx)
-        .await
-        .unwrap_or(None);
-
-        if token_expires.is_some_and(|exp| exp <= now) {
+        if expires_at.is_some_and(|exp| exp <= now) {
             return Err((StatusCode::UNPROCESSABLE_ENTITY, "Access token has expired"));
         }
 
-        if let (Some(reserved_email), Some(reserved_at)) = (reserved_email.as_deref(), reserved_at)
-            && reserved_at >= now - 600
-            && reserved_email != p.email
-        {
-            return Err((StatusCode::CONFLICT, "Access token already reserved"));
-        }
+        "Admin"
+    };
 
+    let user_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO public.users (id, username, email, password_hash, role, created_at, updated_at)
+         VALUES ($1, $2, '', $3, $4, $5, $5)",
+    )
+    .bind(user_id)
+    .bind(&username)
+    .bind(&hash)
+    .bind(role)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Registration failed")
+    })?;
+
+    if !access_token.is_empty() {
         sqlx::query(
             "UPDATE public.access_tokens
-                SET reserved_email = $1, reserved_at = $2
+                SET redeemed_by = $1, redeemed_at = $2
               WHERE token = $3",
         )
-        .bind(&p.email)
+        .bind(user_id)
         .bind(now)
-        .bind(token)
+        .bind(&access_token)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -150,52 +147,20 @@ pub async fn register(
         })?;
     }
 
-    if let Some(existing) = sqlx::query(
-        "SELECT expires_at, created_at
-           FROM public.verification_codes
-          WHERE email = $1
-          FOR UPDATE",
-    )
-    .bind(&p.email)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| {
-        tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Registration failed")
-    })? {
-        use sqlx::Row;
-        let existing_expires_at: i64 = existing.try_get("expires_at").unwrap_or(0);
-        let existing_created_at: i64 = existing.try_get("created_at").unwrap_or(0);
-        if existing_expires_at > now && existing_created_at > now - 60 {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                "Please wait 1 minute before requesting another code",
-            ));
-        }
-        sqlx::query("DELETE FROM public.verification_codes WHERE email = $1")
-            .bind(&p.email)
-            .execute(&mut *tx)
-            .await
-            .ok();
-    }
-
+    let session_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO public.verification_codes
-             (username, email, password_hash, code, expires_at, created_at, access_token)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO public.sessions (id, user_id, created_at, expires_at)
+         VALUES ($1, $2, $3, $4)",
     )
-    .bind(&p.name)
-    .bind(&p.email)
-    .bind(&hash)
-    .bind(&code)
-    .bind(expires_at)
+    .bind(session_id)
+    .bind(user_id)
     .bind(now)
-    .bind(access_token_opt.as_ref())
+    .bind(now + SESSION_MAX_AGE)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
         tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Registration failed")
+        (StatusCode::INTERNAL_SERVER_ERROR, "Session creation failed")
     })?;
 
     tx.commit().await.map_err(|e| {
@@ -203,16 +168,26 @@ pub async fn register(
         (StatusCode::INTERNAL_SERVER_ERROR, "Registration failed")
     })?;
 
-    mailer::send_code(&p.email, &code).await.map_err(|e| {
-        tracing::error!("mailer: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send email")
-    })?;
+    tracing::info!(%username, %user_id, "user registered");
 
-    tracing::info!(email = %p.email, "verification code sent");
+    let mut headers = HeaderMap::new();
+    let csrf_token = new_csrf_token();
+    headers.append(SET_COOKIE, session_cookie(session_id));
+    headers.append(SET_COOKIE, csrf_cookie(&csrf_token));
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-csrf-token"),
+        HeaderValue::from_str(&csrf_token).expect("valid csrf token"),
+    );
     Ok((
         StatusCode::CREATED,
-        Json(MessageResponse {
-            message: "Verification code sent",
+        headers,
+        Json(UserResponse {
+            id: user_id,
+            username,
+            email: String::new(),
+            phone: None,
+            role: role.into(),
+            expires_at: now + SESSION_MAX_AGE,
         }),
     ))
 }

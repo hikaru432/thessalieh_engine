@@ -12,13 +12,13 @@ use super::shared::{
 };
 use crate::api::verified::Verified;
 
-// Per-email lockout tuning: 5 bad attempts → 15-minute lockout.
+// Per-username lockout tuning: 5 bad attempts → 15-minute lockout.
 const MAX_FAILED_ATTEMPTS: i32 = 5;
 const LOCKOUT_SECONDS: i64 = 15 * 60;
 
 #[derive(Deserialize)]
 struct LoginInput {
-    email: String,
+    username: String,
     password: String,
 }
 
@@ -33,16 +33,16 @@ pub async fn login(
 
     let row = sqlx::query(
         "SELECT id, username, email, phone, password_hash, role, failed_login_attempts, lockout_until
-         FROM public.users WHERE email = $1",
+         FROM public.users WHERE username = $1",
     )
-    .bind(&p.email)
+    .bind(&p.username)
     .fetch_optional(&pool)
     .await
     .map_err(|e| {
         tracing::error!("DB: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "Login failed")
     })?
-    .ok_or((StatusCode::UNAUTHORIZED, "Invalid email or password"))?;
+    .ok_or((StatusCode::UNAUTHORIZED, "Invalid username or password"))?;
 
     let user_id: uuid::Uuid = row.try_get("id").map_err(|e| {
         tracing::error!("DB login row id: {e}");
@@ -81,7 +81,7 @@ pub async fn login(
             .bind(now + LOCKOUT_SECONDS)
             .execute(&pool)
             .await;
-            tracing::warn!(email = %p.email, "account locked after repeated failed logins");
+            tracing::warn!(username = %p.username, "account locked after repeated failed logins");
         } else {
             let _ = sqlx::query(
                 "UPDATE public.users SET failed_login_attempts = $2 WHERE id = $1",
@@ -91,7 +91,7 @@ pub async fn login(
             .execute(&pool)
             .await;
         }
-        return Err((StatusCode::UNAUTHORIZED, "Invalid email or password"));
+        return Err((StatusCode::UNAUTHORIZED, "Invalid username or password"));
     }
 
     if failed_login_attempts != 0 || lockout_until != 0 {
@@ -127,7 +127,7 @@ pub async fn login(
         (StatusCode::INTERNAL_SERVER_ERROR, "Session creation failed")
     })?;
 
-    tracing::info!(email = %p.email, user_id = %user_id, "user logged in");
+    tracing::info!(username = %p.username, user_id = %user_id, "user logged in");
 
     let mut headers = HeaderMap::new();
     let csrf_token = new_csrf_token();
