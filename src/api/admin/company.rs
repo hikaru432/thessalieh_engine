@@ -6,8 +6,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
-use super::shared::require_admin;
-use super::users::shared::E;
+use crate::api::shared::require_admin;
+use crate::api::users::shared::E;
 
 #[derive(Serialize)]
 pub struct CompanySettings {

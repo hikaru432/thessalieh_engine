@@ -9,7 +9,8 @@ use axum::{
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use crate::api::{company, contracts, lots, projects, users};
+use crate::api::admin::{commission_rates, company, contracts, lots, projects, roster};
+use crate::api::users;
 
 const BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
@@ -50,6 +51,23 @@ pub fn routes() -> Router {
         .route(
             "/company/settings",
             get(company::get_settings).patch(company::update_settings),
+        )
+        .route("/users", get(users::list_users))
+        .route(
+            "/roster",
+            get(roster::list_roster).post(roster::create_roster_entry),
+        )
+        .route(
+            "/roster/{id}",
+            patch(roster::update_roster_entry).delete(roster::delete_roster_entry),
+        )
+        .route(
+            "/commission-rates",
+            get(commission_rates::list_commission_rates),
+        )
+        .route(
+            "/commission-rates/{role}",
+            patch(commission_rates::update_commission_rate),
         )
         .route(
             "/projects",

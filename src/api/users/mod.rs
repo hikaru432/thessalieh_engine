@@ -1,3 +1,4 @@
+mod list;
 mod login;
 mod logout;
 mod password_reset;
@@ -7,6 +8,7 @@ mod search;
 mod session;
 pub mod shared;
 
+pub use list::list_users;
 pub use login::login;
 pub use logout::logout;
 pub use password_reset::{confirm as password_reset_confirm, request as password_reset_request};

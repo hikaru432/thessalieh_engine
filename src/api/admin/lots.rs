@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use super::shared::require_admin;
-use super::users::shared::E;
+use crate::api::shared::require_admin;
+use crate::api::users::shared::E;
 
 const LOT_TYPES: [&str; 4] = ["Inner", "Commercial", "Corner", "Commercial / Corner"];
 const STATUSES: [&str; 4] = ["Available", "Hold", "Reserved", "Sold"];

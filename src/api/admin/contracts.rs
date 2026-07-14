@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use super::shared::require_admin;
-use super::users::shared::E;
+use crate::api::shared::require_admin;
+use crate::api::users::shared::E;
 
 const PAYMENT_PLANS: [&str; 3] = ["installment", "half", "full"];
 const PAYMENT_METHODS: [&str; 4] = ["cash", "card", "gcash", "maya"];
@@ -39,6 +39,7 @@ pub struct ContractResponse {
     pub marketing_representative: String,
     pub agent_code: String,
     pub selling_agent_id: Option<String>,
+    pub agent_id: Option<Uuid>,
     pub source_of_buyer: Vec<String>,
     pub other_source: String,
     pub particulars: String,
@@ -87,6 +88,7 @@ pub struct ContractInput {
     pub marketing_representative: String,
     pub agent_code: String,
     pub selling_agent_id: Option<String>,
+    pub agent_id: Option<Uuid>,
     pub source_of_buyer: Vec<String>,
     pub other_source: String,
     pub particulars: String,
@@ -120,6 +122,18 @@ fn add_months(date: NaiveDate, months: i32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, date.day().min(last_day)).unwrap()
 }
 
+fn map_contract_db_error(action: &'static str) -> impl Fn(sqlx::Error) -> E {
+    move |e| {
+        if e.as_database_error()
+            .is_some_and(|d| d.code().as_deref() == Some("23503"))
+        {
+            return (StatusCode::UNPROCESSABLE_ENTITY, "Selected agent not found");
+        }
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, action)
+    }
+}
+
 fn validate_contract_input(p: &ContractInput) -> Result<(), E> {
     if p.buyer_name.trim().is_empty() || p.buyer_name.len() > 255 {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "Invalid buyer name"));
@@ -144,7 +158,8 @@ const CONTRACT_COLUMNS_WITH_TOTALS: &str = "
     c.lot_block, c.lot_lot, c.lot_area, c.lot_type, c.lot_rate,
     c.contract_price, c.payment_plan, c.initial_payment, c.term_years, c.monthly_amortization,
     c.due_day, c.next_due_date, c.approval_at,
-    c.marketing_representative, c.agent_code, c.selling_agent_id, c.source_of_buyer, c.other_source,
+    c.marketing_representative, c.agent_code, c.selling_agent_id, c.agent_id,
+    c.source_of_buyer, c.other_source,
     c.particulars, c.updated_at,
     COALESCE(SUM(p.amount), 0) AS total_paid";
 
@@ -188,6 +203,7 @@ fn row_to_contract(row: sqlx::postgres::PgRow) -> ContractResponse {
         marketing_representative: row.try_get("marketing_representative").unwrap_or_default(),
         agent_code: row.try_get("agent_code").unwrap_or_default(),
         selling_agent_id: row.try_get("selling_agent_id").ok().flatten(),
+        agent_id: row.try_get("agent_id").ok().flatten(),
         source_of_buyer: row.try_get("source_of_buyer").unwrap_or_default(),
         other_source: row.try_get("other_source").unwrap_or_default(),
         particulars: row.try_get("particulars").unwrap_or_default(),
@@ -340,10 +356,11 @@ pub async fn create_contract(
              lot_block, lot_lot, lot_area, lot_type, lot_rate,
              contract_price, payment_plan, initial_payment, term_years, monthly_amortization,
              due_day, next_due_date, approval_at,
-             marketing_representative, agent_code, selling_agent_id, source_of_buyer, other_source,
+             marketing_representative, agent_code, selling_agent_id, agent_id,
+             source_of_buyer, other_source,
              particulars, created_at, updated_at
          )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$26)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$27)
       RETURNING id",
     )
     .bind(project_id)
@@ -368,16 +385,14 @@ pub async fn create_contract(
     .bind(&p.marketing_representative)
     .bind(&p.agent_code)
     .bind(&p.selling_agent_id)
+    .bind(p.agent_id)
     .bind(&p.source_of_buyer)
     .bind(&p.other_source)
     .bind(&p.particulars)
     .bind(now)
     .fetch_one(&pool)
     .await
-    .map_err(|e| {
-        tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create contract")
-    })?;
+    .map_err(map_contract_db_error("Failed to create contract"))?;
 
     let contract_id: Uuid = row.try_get("id").unwrap_or_default();
 
@@ -442,9 +457,9 @@ pub async fn update_contract(
              lot_block = $6, lot_lot = $7, lot_area = $8, lot_type = $9, lot_rate = $10,
              contract_price = $11, payment_plan = $12, initial_payment = $13, term_years = $14,
              monthly_amortization = $15, due_day = $16, next_due_date = $17, approval_at = $18,
-             marketing_representative = $19, agent_code = $20, selling_agent_id = $21,
-             source_of_buyer = $22, other_source = $23, particulars = $24, updated_at = $25
-           WHERE id = $26",
+             marketing_representative = $19, agent_code = $20, selling_agent_id = $21, agent_id = $22,
+             source_of_buyer = $23, other_source = $24, particulars = $25, updated_at = $26
+           WHERE id = $27",
     )
     .bind(p.lot_id)
     .bind(p.buyer_name.trim())
@@ -467,6 +482,7 @@ pub async fn update_contract(
     .bind(&p.marketing_representative)
     .bind(&p.agent_code)
     .bind(&p.selling_agent_id)
+    .bind(p.agent_id)
     .bind(&p.source_of_buyer)
     .bind(&p.other_source)
     .bind(&p.particulars)
@@ -474,10 +490,7 @@ pub async fn update_contract(
     .bind(id)
     .execute(&pool)
     .await
-    .map_err(|e| {
-        tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to update contract")
-    })?;
+    .map_err(map_contract_db_error("Failed to update contract"))?;
 
     if updated.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "Contract not found"));
