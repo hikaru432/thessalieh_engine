@@ -3,7 +3,7 @@ use axum::{
     extract::Path,
     http::{HeaderMap, StatusCode},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -12,7 +12,7 @@ use crate::api::shared::require_admin;
 use crate::api::users::shared::E;
 
 const LOT_TYPES: [&str; 4] = ["Inner", "Commercial", "Corner", "Commercial / Corner"];
-const STATUSES: [&str; 4] = ["Available", "Hold", "Reserved", "Sold"];
+const STATUSES: [&str; 5] = ["Available", "Hold", "Reserved", "Installment", "Sold"];
 
 #[derive(Serialize)]
 pub struct LotResponse {
@@ -27,6 +27,8 @@ pub struct LotResponse {
     pub owner_buyer: Option<String>,
     pub on_hold: bool,
     pub status: String,
+    /// Unix seconds; set when status is Reserved.
+    pub reserved_until: Option<i64>,
     pub updated_at: i64,
 }
 
@@ -49,9 +51,17 @@ pub struct UpdateLotInput {
     pub owner_buyer: Option<String>,
     pub on_hold: bool,
     pub status: String,
+    /// Unix seconds; required (and must be in the future) when status is Reserved.
+    pub reserved_until: Option<i64>,
 }
 
 fn row_to_lot(row: sqlx::postgres::PgRow) -> LotResponse {
+    let reserved_until: Option<i64> = row
+        .try_get::<Option<DateTime<Utc>>, _>("reserved_until")
+        .ok()
+        .flatten()
+        .map(|dt| dt.timestamp());
+
     LotResponse {
         id: row.try_get("id").unwrap_or_default(),
         project_id: row.try_get("project_id").unwrap_or_default(),
@@ -64,6 +74,7 @@ fn row_to_lot(row: sqlx::postgres::PgRow) -> LotResponse {
         owner_buyer: row.try_get("owner_buyer").ok().flatten(),
         on_hold: row.try_get("on_hold").unwrap_or(false),
         status: row.try_get("status").unwrap_or_default(),
+        reserved_until,
         updated_at: row.try_get("updated_at").unwrap_or(0),
     }
 }
@@ -107,6 +118,28 @@ fn validate_area_rate(area: f64, rate: f64) -> Result<(), E> {
     Ok(())
 }
 
+fn resolve_reserved_until(status: &str, reserved_until: Option<i64>) -> Result<Option<DateTime<Utc>>, E> {
+    if status != "Reserved" {
+        return Ok(None);
+    }
+    let Some(ts) = reserved_until else {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Reserved lots require a reserved_until timestamp",
+        ));
+    };
+    let Some(dt) = DateTime::from_timestamp(ts, 0) else {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "Invalid reserved_until"));
+    };
+    if dt <= Utc::now() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reserved_until must be in the future",
+        ));
+    }
+    Ok(Some(dt))
+}
+
 async fn project_exists(pool: &PgPool, project_id: Uuid) -> Result<bool, E> {
     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM public.projects WHERE id = $1)")
         .bind(project_id)
@@ -119,7 +152,7 @@ async fn project_exists(pool: &PgPool, project_id: Uuid) -> Result<bool, E> {
 }
 
 const LOT_COLUMNS: &str = "id, project_id, block, lot, lot_type, area, rate, contract_price,
-                            owner_buyer, on_hold, status, updated_at";
+                            owner_buyer, on_hold, status, reserved_until, updated_at";
 
 pub async fn list_lots(
     Extension(pool): Extension<PgPool>,
@@ -218,6 +251,8 @@ pub async fn update_lot(
         ));
     }
 
+    let reserved_until = resolve_reserved_until(&p.status, p.reserved_until)?;
+
     let now = Utc::now().timestamp();
     let contract_price = p.area * p.rate;
 
@@ -225,8 +260,8 @@ pub async fn update_lot(
         "UPDATE public.lots
             SET block = $1, lot = $2, lot_type = $3, area = $4, rate = $5,
                 contract_price = $6, owner_buyer = $7, on_hold = $8, status = $9,
-                updated_at = $10
-          WHERE id = $11
+                reserved_until = $10, updated_at = $11
+          WHERE id = $12
       RETURNING {LOT_COLUMNS}",
     ))
     .bind(p.block.trim())
@@ -238,6 +273,7 @@ pub async fn update_lot(
     .bind(&owner_buyer)
     .bind(p.on_hold)
     .bind(&p.status)
+    .bind(reserved_until)
     .bind(now)
     .bind(id)
     .fetch_optional(&pool)

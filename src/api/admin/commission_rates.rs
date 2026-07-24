@@ -10,7 +10,15 @@ use sqlx::{PgPool, Row};
 use crate::api::shared::require_admin;
 use crate::api::users::shared::E;
 
-const ROLES: [&str; 3] = ["Lead Broker", "Titling Officer", "Agent"];
+const ROLES: [&str; 7] = [
+    "Lead Broker",
+    "Titling Officer",
+    "Agent",
+    "Legal Counsel",
+    "Land Owner",
+    "Hypomone",
+    "Project Dev & Processing",
+];
 
 #[derive(Serialize)]
 pub struct CommissionRateResponse {
@@ -75,15 +83,17 @@ pub async fn update_commission_rate(
     let now = Utc::now().timestamp();
 
     let row = sqlx::query(
-        "UPDATE public.commission_rates
-            SET commission_rate = $1, updated_at = $2
-          WHERE role = $3
+        "INSERT INTO public.commission_rates (role, commission_rate, updated_at)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (role) DO UPDATE
+            SET commission_rate = EXCLUDED.commission_rate,
+                updated_at = EXCLUDED.updated_at
       RETURNING role, commission_rate, updated_at",
     )
+    .bind(&role)
     .bind(p.commission_rate)
     .bind(now)
-    .bind(&role)
-    .fetch_optional(&pool)
+    .fetch_one(&pool)
     .await
     .map_err(|e| {
         tracing::error!("DB: {e}");
@@ -92,7 +102,7 @@ pub async fn update_commission_rate(
             "Failed to update commission rate",
         )
     })?
-    .ok_or((StatusCode::NOT_FOUND, "Unknown role"))?;
+    ;
 
     Ok(Json(row_to_rate(row)))
 }

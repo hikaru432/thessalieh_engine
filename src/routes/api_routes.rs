@@ -9,7 +9,10 @@ use axum::{
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use crate::api::admin::{commission_rates, company, contracts, lots, projects, roster};
+use crate::api::admin::{
+    commission_rates, commission_row_meta, commission_status, company, contracts, lots, projects,
+    roster,
+};
 use crate::api::users;
 
 const BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
@@ -52,7 +55,11 @@ pub fn routes() -> Router {
             "/company/settings",
             get(company::get_settings).patch(company::update_settings),
         )
-        .route("/users", get(users::list_users))
+        .route(
+            "/company/agent-commission-split-months",
+            patch(company::update_agent_commission_split_months),
+        )
+        .route("/users", get(users::list_users).post(users::create_user))
         .route(
             "/roster",
             get(roster::list_roster).post(roster::create_roster_entry),
@@ -74,6 +81,20 @@ pub fn routes() -> Router {
             get(projects::list_projects).post(projects::create_project),
         )
         .route(
+            "/projects/{project_id}/agents",
+            patch(projects::update_project_agents),
+        )
+        .route(
+            "/projects/{project_id}/commission-status",
+            get(commission_status::list_commission_status)
+                .put(commission_status::upsert_commission_status),
+        )
+        .route(
+            "/projects/{project_id}/commission-row-meta",
+            get(commission_row_meta::list_commission_row_meta)
+                .put(commission_row_meta::upsert_commission_row_meta),
+        )
+        .route(
             "/projects/{project_id}/lots",
             get(lots::list_lots).post(lots::create_lot),
         )
@@ -84,6 +105,10 @@ pub fn routes() -> Router {
         .route(
             "/projects/{project_id}/contracts",
             get(contracts::list_contracts).post(contracts::create_contract),
+        )
+        .route(
+            "/projects/{project_id}/payments",
+            get(contracts::list_project_payments),
         )
         .route(
             "/contracts/{id}",

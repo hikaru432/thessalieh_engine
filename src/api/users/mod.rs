@@ -1,3 +1,5 @@
+mod create;
+mod insert;
 mod list;
 mod login;
 mod logout;
@@ -8,6 +10,7 @@ mod search;
 mod session;
 pub mod shared;
 
+pub use create::create_user;
 pub use list::list_users;
 pub use login::login;
 pub use logout::logout;

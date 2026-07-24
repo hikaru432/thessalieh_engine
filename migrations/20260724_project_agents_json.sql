@@ -1,0 +1,2 @@
+ALTER TABLE public.projects
+  ADD COLUMN IF NOT EXISTS agents_json JSONB NOT NULL DEFAULT '[]';
