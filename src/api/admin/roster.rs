@@ -11,8 +11,19 @@ use uuid::Uuid;
 use crate::api::shared::require_admin;
 use crate::api::users::shared::E;
 
-const ROLES: [&str; 3] = ["Lead Broker", "Titling Officer", "Agent"];
 const STATUSES: [&str; 2] = ["Active", "Inactive"];
+
+/// Labels of the admin-configurable upline (org-chart root) roles — e.g. "Lead Broker",
+/// "Titling Officer", plus any custom roles added via /upline-role-types.
+async fn fetch_upline_role_labels(pool: &PgPool) -> Result<Vec<String>, E> {
+    sqlx::query_scalar("SELECT label FROM public.upline_role_types")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+        })
+}
 
 #[derive(Serialize)]
 pub struct RosterResponse {
@@ -61,8 +72,14 @@ fn row_to_roster(row: sqlx::postgres::PgRow) -> RosterResponse {
     }
 }
 
-fn validate_roster_input(p: &RosterInput, current_id: Option<Uuid>, agent_pool_cap: f64) -> Result<(), E> {
-    if !ROLES.contains(&p.role.as_str()) {
+fn validate_roster_input(
+    p: &RosterInput,
+    current_id: Option<Uuid>,
+    agent_pool_cap: f64,
+    upline_labels: &[String],
+) -> Result<(), E> {
+    let is_upline_role = upline_labels.iter().any(|label| label == &p.role);
+    if p.role != "Agent" && !is_upline_role {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "Invalid role"));
     }
     if p.code.trim().is_empty() || p.code.len() > 100 {
@@ -78,39 +95,36 @@ fn validate_roster_input(p: &RosterInput, current_id: Option<Uuid>, agent_pool_c
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "Invalid status"));
     }
 
-    match p.role.as_str() {
-        "Lead Broker" | "Titling Officer" => {
-            if p.commission_rate != 0.0 {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "Lead Broker and Titling Officer use company baseline rates",
-                ));
-            }
-            if p.broker_id.is_some() {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "Only an Agent can report to a broker",
-                ));
-            }
+    if p.role == "Agent" {
+        if p.broker_id.is_none() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Agent must have an upline",
+            ));
         }
-        "Agent" => {
-            if p.broker_id.is_none() {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "Agent must have an upline",
-                ));
-            }
-            if !p.commission_rate.is_finite()
-                || p.commission_rate < 0.0
-                || p.commission_rate > agent_pool_cap
-            {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "Share must be within the agent pool limit",
-                ));
-            }
+        if !p.commission_rate.is_finite()
+            || p.commission_rate < 0.0
+            || p.commission_rate > agent_pool_cap
+        {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Share must be within the agent pool limit",
+            ));
         }
-        _ => {}
+    } else {
+        // Upline root role (Lead Broker, Titling Officer, or a custom role).
+        if p.commission_rate != 0.0 {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Upline roles use their configured base rate, not a manual share",
+            ));
+        }
+        if p.broker_id.is_some() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Only an Agent can report to an upline",
+            ));
+        }
     }
 
     if let (Some(broker_id), Some(id)) = (p.broker_id, current_id)
@@ -149,16 +163,21 @@ async fn validate_broker_upline(pool: &PgPool, broker_id: Uuid) -> Result<(), E>
         (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
     })?;
 
-    match role.as_deref() {
-        Some("Lead Broker") | Some("Titling Officer") => Ok(()),
-        Some(_) => Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Upline must be a Lead Broker or Titling Officer",
-        )),
-        None => Err((
+    let Some(role) = role else {
+        return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "Referenced user or broker not found",
-        )),
+        ));
+    };
+
+    let upline_labels = fetch_upline_role_labels(pool).await?;
+    if upline_labels.iter().any(|label| label == &role) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Upline must be one of the configured upline roles",
+        ))
     }
 }
 
@@ -170,27 +189,19 @@ fn normalized_commission_rate(role: &str, commission_rate: f64) -> f64 {
     }
 }
 
-fn user_role_for_roster(roster_role: &str) -> &'static str {
-    match roster_role {
-        "Lead Broker" => "Lead Broker",
-        "Titling Officer" => "Titling Officer",
-        "Agent" => "Agent",
-        _ => "User",
-    }
-}
-
+/// `roster.role` is already validated (by `validate_roster_input`) to be either "Agent"
+/// or a known upline_role_types label, and both are valid `users.role` values directly.
 async fn sync_user_role(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: Uuid,
     roster_role: &str,
     now: i64,
 ) -> Result<(), E> {
-    let role = user_role_for_roster(roster_role);
     let result = sqlx::query(
         "UPDATE public.users SET role = $1, updated_at = $2
           WHERE id = $3 AND role != 'Admin'",
     )
-    .bind(role)
+    .bind(roster_role)
     .bind(now)
     .bind(user_id)
     .execute(&mut **tx)
@@ -307,7 +318,8 @@ pub async fn create_roster_entry(
 ) -> Result<Json<RosterResponse>, E> {
     require_admin(&pool, &headers).await?;
     let agent_pool_cap = get_agent_pool_cap(&pool).await?;
-    validate_roster_input(&p, None, agent_pool_cap)?;
+    let upline_labels = fetch_upline_role_labels(&pool).await?;
+    validate_roster_input(&p, None, agent_pool_cap, &upline_labels)?;
     if p.role == "Agent" {
         if let Some(broker_id) = p.broker_id {
             validate_broker_upline(&pool, broker_id).await?;
@@ -370,7 +382,8 @@ pub async fn update_roster_entry(
 ) -> Result<Json<RosterResponse>, E> {
     require_admin(&pool, &headers).await?;
     let agent_pool_cap = get_agent_pool_cap(&pool).await?;
-    validate_roster_input(&p, Some(id), agent_pool_cap)?;
+    let upline_labels = fetch_upline_role_labels(&pool).await?;
+    validate_roster_input(&p, Some(id), agent_pool_cap, &upline_labels)?;
     if p.role == "Agent" {
         if let Some(broker_id) = p.broker_id {
             validate_broker_upline(&pool, broker_id).await?;

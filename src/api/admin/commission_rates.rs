@@ -10,15 +10,31 @@ use sqlx::{PgPool, Row};
 use crate::api::shared::require_admin;
 use crate::api::users::shared::E;
 
-const ROLES: [&str; 7] = [
-    "Lead Broker",
-    "Titling Officer",
+/// Fixed non-root roles: "Agent" is the shared downline pool, the rest are TCP
+/// stakeholder allocations — neither is an org-chart upline root, so they stay hardcoded.
+/// Upline root roles (Lead Broker, Titling Officer, and any custom roles) come from
+/// upline_role_types instead.
+const FIXED_ROLES: [&str; 5] = [
     "Agent",
     "Legal Counsel",
     "Land Owner",
     "Hypomone",
     "Project Dev & Processing",
 ];
+
+async fn is_known_role(pool: &PgPool, role: &str) -> Result<bool, E> {
+    if FIXED_ROLES.contains(&role) {
+        return Ok(true);
+    }
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM public.upline_role_types WHERE label = $1)")
+        .bind(role)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+        })
+}
 
 #[derive(Serialize)]
 pub struct CommissionRateResponse {
@@ -70,7 +86,7 @@ pub async fn update_commission_rate(
 ) -> Result<Json<CommissionRateResponse>, E> {
     require_admin(&pool, &headers).await?;
 
-    if !ROLES.contains(&role.as_str()) {
+    if !is_known_role(&pool, &role).await? {
         return Err((StatusCode::NOT_FOUND, "Unknown role"));
     }
     if !p.commission_rate.is_finite() || !(0.0..=100.0).contains(&p.commission_rate) {

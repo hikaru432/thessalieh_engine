@@ -81,6 +81,31 @@ fn validate_agents_json(agents: &Value) -> Result<(), E> {
     Ok(())
 }
 
+/// Pull root roster UUIDs from agents_json (agent.id = roster.id).
+fn root_roster_ids_from_agents(agents: &Value) -> (Option<Uuid>, Option<Uuid>) {
+    let mut lead_broker = None;
+    let mut titling_officer = None;
+    let Some(items) = agents.as_array() else {
+        return (None, None);
+    };
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let role = obj.get("role").and_then(Value::as_str).unwrap_or("");
+        let id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok());
+        match role {
+            "lead-broker" if lead_broker.is_none() => lead_broker = id,
+            "titling-officer" if titling_officer.is_none() => titling_officer = id,
+            _ => {}
+        }
+    }
+    (lead_broker, titling_officer)
+}
+
 pub async fn list_projects(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,
@@ -142,15 +167,21 @@ pub async fn update_project_agents(
     require_admin(&pool, &headers).await?;
     validate_agents_json(&p.agents)?;
 
+    let (lead_broker_roster_id, titling_officer_roster_id) = root_roster_ids_from_agents(&p.agents);
     let now = Utc::now().timestamp();
 
     let row = sqlx::query(&format!(
         "UPDATE public.projects
-            SET agents_json = $1, updated_at = $2
-          WHERE id = $3 AND company_id = 1
+            SET agents_json = $1,
+                lead_broker_roster_id = $2,
+                titling_officer_roster_id = $3,
+                updated_at = $4
+          WHERE id = $5 AND company_id = 1
       RETURNING {PROJECT_COLUMNS}",
     ))
-    .bind(p.agents)
+    .bind(&p.agents)
+    .bind(lead_broker_roster_id)
+    .bind(titling_officer_roster_id)
     .bind(now)
     .bind(project_id)
     .fetch_optional(&pool)

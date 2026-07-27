@@ -377,7 +377,7 @@ fn validate_contract_input(p: &ContractInput) -> Result<(), E> {
     Ok(())
 }
 
-const CONTRACT_COLUMNS_WITH_TOTALS: &str = "
+pub(crate) const CONTRACT_COLUMNS_WITH_TOTALS: &str = "
     c.id, c.project_id, c.lot_id, c.buyer_user_id, MAX(bu.username) AS buyer_username,
     c.buyer_name, c.buyer_last_name, c.buyer_first_name, c.buyer_middle_name,
     c.buyer_address, c.buyer_gmail, c.buyer_contact,
@@ -409,10 +409,14 @@ async fn validate_buyer_user(
         ))?;
 
     let role: String = row.try_get("role").unwrap_or_default();
-    if role != "User" {
+    let allowed = matches!(
+        role.as_str(),
+        "User" | "Agent" | "Lead Broker" | "Titling Officer"
+    );
+    if !allowed {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            "Selected account is not a buyer user",
+            "Selected account cannot be used as a buyer",
         ));
     }
 
@@ -441,7 +445,7 @@ async fn validate_buyer_user(
     Ok(())
 }
 
-fn row_to_contract(row: sqlx::postgres::PgRow) -> ContractResponse {
+pub(crate) fn row_to_contract(row: sqlx::postgres::PgRow) -> ContractResponse {
     let contract_price: f64 = row.try_get("contract_price").unwrap_or(0.0);
     let total_paid: f64 = row.try_get("total_paid").unwrap_or(0.0);
     let balance = (contract_price - total_paid).max(0.0);
@@ -503,7 +507,7 @@ fn row_to_contract(row: sqlx::postgres::PgRow) -> ContractResponse {
     }
 }
 
-fn row_to_payment(row: sqlx::postgres::PgRow) -> PaymentResponse {
+pub(crate) fn row_to_payment(row: sqlx::postgres::PgRow) -> PaymentResponse {
     PaymentResponse {
         id: row.try_get("id").unwrap_or_default(),
         contract_id: row.try_get("contract_id").unwrap_or_default(),
@@ -560,7 +564,8 @@ async fn sync_lot_for_contract(
     };
     sqlx::query(
         "UPDATE public.lots
-            SET owner_buyer = $1, on_hold = false, status = $2, reserved_until = NULL
+            SET owner_buyer = $1, on_hold = false, status = $2, reserved_until = NULL,
+                reserve_agent_id = NULL, reserve_notes = ''
           WHERE id = $3",
     )
     .bind(buyer_name)
@@ -578,7 +583,8 @@ async fn sync_lot_for_contract(
 async fn clear_lot(pool: &PgPool, lot_id: Uuid) -> Result<(), E> {
     sqlx::query(
         "UPDATE public.lots
-            SET owner_buyer = NULL, on_hold = false, status = 'Available', reserved_until = NULL
+            SET owner_buyer = NULL, on_hold = false, status = 'Available', reserved_until = NULL,
+                reserve_agent_id = NULL, reserve_notes = ''
           WHERE id = $1",
     )
     .bind(lot_id)
@@ -1166,6 +1172,18 @@ pub async fn delete_contract(
     if let Some(lot_id) = lot_id {
         clear_lot(&pool, lot_id).await?;
     }
+
+    sqlx::query("DELETE FROM public.commission_row_meta WHERE row_key = $1")
+        .bind(id.to_string())
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to clean up commission row meta",
+            )
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }

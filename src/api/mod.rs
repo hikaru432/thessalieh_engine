@@ -1,4 +1,9 @@
 pub mod admin;
+pub mod agent;
+pub mod buyer;
+pub mod leadbroker;
+pub mod titlingofficer;
+pub mod upline_portal;
 pub mod mailer;
 pub mod shared;
 pub mod users;

@@ -6,3 +6,4 @@ pub mod contracts;
 pub mod lots;
 pub mod projects;
 pub mod roster;
+pub mod upline_role_types;

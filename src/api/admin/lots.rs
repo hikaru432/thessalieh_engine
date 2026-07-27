@@ -29,6 +29,8 @@ pub struct LotResponse {
     pub status: String,
     /// Unix seconds; set when status is Reserved.
     pub reserved_until: Option<i64>,
+    pub reserve_agent_id: Option<String>,
+    pub reserve_notes: String,
     pub updated_at: i64,
 }
 
@@ -53,9 +55,13 @@ pub struct UpdateLotInput {
     pub status: String,
     /// Unix seconds; required (and must be in the future) when status is Reserved.
     pub reserved_until: Option<i64>,
+    #[serde(default)]
+    pub reserve_agent_id: Option<String>,
+    #[serde(default)]
+    pub reserve_notes: Option<String>,
 }
 
-fn row_to_lot(row: sqlx::postgres::PgRow) -> LotResponse {
+pub fn row_to_lot(row: sqlx::postgres::PgRow) -> LotResponse {
     let reserved_until: Option<i64> = row
         .try_get::<Option<DateTime<Utc>>, _>("reserved_until")
         .ok()
@@ -75,6 +81,8 @@ fn row_to_lot(row: sqlx::postgres::PgRow) -> LotResponse {
         on_hold: row.try_get("on_hold").unwrap_or(false),
         status: row.try_get("status").unwrap_or_default(),
         reserved_until,
+        reserve_agent_id: row.try_get("reserve_agent_id").ok().flatten(),
+        reserve_notes: row.try_get("reserve_notes").unwrap_or_default(),
         updated_at: row.try_get("updated_at").unwrap_or(0),
     }
 }
@@ -118,7 +126,10 @@ fn validate_area_rate(area: f64, rate: f64) -> Result<(), E> {
     Ok(())
 }
 
-fn resolve_reserved_until(status: &str, reserved_until: Option<i64>) -> Result<Option<DateTime<Utc>>, E> {
+pub fn resolve_reserved_until(
+    status: &str,
+    reserved_until: Option<i64>,
+) -> Result<Option<DateTime<Utc>>, E> {
     if status != "Reserved" {
         return Ok(None);
     }
@@ -140,6 +151,31 @@ fn resolve_reserved_until(status: &str, reserved_until: Option<i64>) -> Result<O
     Ok(Some(dt))
 }
 
+/// Clears agent/notes when leaving Reserved; otherwise trims optional fields.
+pub fn resolve_reserve_meta(
+    status: &str,
+    reserve_agent_id: Option<String>,
+    reserve_notes: Option<String>,
+) -> Result<(Option<String>, String), E> {
+    if status != "Reserved" {
+        return Ok((None, String::new()));
+    }
+    let agent = reserve_agent_id
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if agent.as_ref().is_some_and(|v| v.len() > 64) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reserve_agent_id too long",
+        ));
+    }
+    let notes = reserve_notes.unwrap_or_default().trim().to_string();
+    if notes.len() > 2000 {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "reserve_notes too long"));
+    }
+    Ok((agent, notes))
+}
+
 async fn project_exists(pool: &PgPool, project_id: Uuid) -> Result<bool, E> {
     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM public.projects WHERE id = $1)")
         .bind(project_id)
@@ -151,8 +187,9 @@ async fn project_exists(pool: &PgPool, project_id: Uuid) -> Result<bool, E> {
         })
 }
 
-const LOT_COLUMNS: &str = "id, project_id, block, lot, lot_type, area, rate, contract_price,
-                            owner_buyer, on_hold, status, reserved_until, updated_at";
+pub const LOT_COLUMNS: &str = "id, project_id, block, lot, lot_type, area, rate, contract_price,
+                            owner_buyer, on_hold, status, reserved_until,
+                            reserve_agent_id, reserve_notes, updated_at";
 
 pub async fn list_lots(
     Extension(pool): Extension<PgPool>,
@@ -252,6 +289,8 @@ pub async fn update_lot(
     }
 
     let reserved_until = resolve_reserved_until(&p.status, p.reserved_until)?;
+    let (reserve_agent_id, reserve_notes) =
+        resolve_reserve_meta(&p.status, p.reserve_agent_id, p.reserve_notes)?;
 
     let now = Utc::now().timestamp();
     let contract_price = p.area * p.rate;
@@ -260,8 +299,9 @@ pub async fn update_lot(
         "UPDATE public.lots
             SET block = $1, lot = $2, lot_type = $3, area = $4, rate = $5,
                 contract_price = $6, owner_buyer = $7, on_hold = $8, status = $9,
-                reserved_until = $10, updated_at = $11
-          WHERE id = $12
+                reserved_until = $10, reserve_agent_id = $11, reserve_notes = $12,
+                updated_at = $13
+          WHERE id = $14
       RETURNING {LOT_COLUMNS}",
     ))
     .bind(p.block.trim())
@@ -274,6 +314,8 @@ pub async fn update_lot(
     .bind(p.on_hold)
     .bind(&p.status)
     .bind(reserved_until)
+    .bind(&reserve_agent_id)
+    .bind(&reserve_notes)
     .bind(now)
     .bind(id)
     .fetch_optional(&pool)

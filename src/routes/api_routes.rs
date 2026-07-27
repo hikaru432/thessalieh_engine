@@ -11,8 +11,13 @@ use sqlx::PgPool;
 
 use crate::api::admin::{
     commission_rates, commission_row_meta, commission_status, company, contracts, lots, projects,
-    roster,
+    roster, upline_role_types,
 };
+use crate::api::buyer;
+use crate::api::leadbroker;
+use crate::api::titlingofficer;
+use crate::api::upline_portal;
+use crate::api::agent;
 use crate::api::users;
 
 const BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
@@ -51,6 +56,96 @@ pub fn routes() -> Router {
 
     // Company, project, lot, and contract data routes — capped at 10 MB
     let data_routes = Router::new()
+        .route("/me/contracts", get(buyer::contracts::list_my_contracts))
+        .route("/me/lb/projects", get(leadbroker::list_my_projects))
+        .route(
+            "/me/lb/projects/{project_id}/context",
+            get(leadbroker::get_project_context),
+        )
+        .route(
+            "/me/lb/projects/{project_id}/lots",
+            get(leadbroker::list_project_lots),
+        )
+        .route(
+            "/me/lb/projects/{project_id}/contracts",
+            get(leadbroker::list_project_contracts),
+        )
+        .route(
+            "/me/lb/projects/{project_id}/payments",
+            get(leadbroker::list_project_payments),
+        )
+        .route(
+            "/me/lb/projects/{project_id}/commission-status",
+            get(leadbroker::list_commission_status),
+        )
+        .route("/me/lb/lots/{id}", patch(leadbroker::patch_lot_reserve))
+        .route("/me/to/projects", get(titlingofficer::list_my_projects))
+        .route(
+            "/me/to/projects/{project_id}/context",
+            get(titlingofficer::get_project_context),
+        )
+        .route(
+            "/me/to/projects/{project_id}/lots",
+            get(titlingofficer::list_project_lots),
+        )
+        .route(
+            "/me/to/projects/{project_id}/contracts",
+            get(titlingofficer::list_project_contracts),
+        )
+        .route(
+            "/me/to/projects/{project_id}/payments",
+            get(titlingofficer::list_project_payments),
+        )
+        .route(
+            "/me/to/projects/{project_id}/commission-status",
+            get(titlingofficer::list_commission_status),
+        )
+        .route("/me/to/lots/{id}", patch(titlingofficer::patch_lot_reserve))
+        .route(
+            "/me/upline/{role_slug}/projects",
+            get(upline_portal::list_my_projects),
+        )
+        .route(
+            "/me/upline/{role_slug}/projects/{project_id}/context",
+            get(upline_portal::get_project_context),
+        )
+        .route(
+            "/me/upline/{role_slug}/projects/{project_id}/lots",
+            get(upline_portal::list_project_lots),
+        )
+        .route(
+            "/me/upline/{role_slug}/projects/{project_id}/contracts",
+            get(upline_portal::list_project_contracts),
+        )
+        .route(
+            "/me/upline/{role_slug}/projects/{project_id}/payments",
+            get(upline_portal::list_project_payments),
+        )
+        .route(
+            "/me/upline/{role_slug}/projects/{project_id}/commission-status",
+            get(upline_portal::list_commission_status),
+        )
+        .route(
+            "/me/upline/{role_slug}/lots/{id}",
+            patch(upline_portal::patch_lot_reserve),
+        )
+        .route("/me/agent/projects", get(agent::list_my_projects))
+        .route(
+            "/me/agent/projects/{project_id}/context",
+            get(agent::get_project_context),
+        )
+        .route(
+            "/me/agent/projects/{project_id}/contracts",
+            get(agent::list_project_contracts),
+        )
+        .route(
+            "/me/agent/projects/{project_id}/payments",
+            get(agent::list_project_payments),
+        )
+        .route(
+            "/me/agent/projects/{project_id}/commission-status",
+            get(agent::list_commission_status),
+        )
         .route(
             "/company/settings",
             get(company::get_settings).patch(company::update_settings),
@@ -75,6 +170,16 @@ pub fn routes() -> Router {
         .route(
             "/commission-rates/{role}",
             patch(commission_rates::update_commission_rate),
+        )
+        .route(
+            "/upline-role-types",
+            get(upline_role_types::list_upline_role_types)
+                .post(upline_role_types::create_upline_role_type),
+        )
+        .route(
+            "/upline-role-types/{slug}",
+            patch(upline_role_types::update_upline_role_type)
+                .delete(upline_role_types::delete_upline_role_type),
         )
         .route(
             "/projects",

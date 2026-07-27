@@ -62,7 +62,7 @@ fn format_date(d: NaiveDate) -> String {
     d.format("%Y-%m-%d").to_string()
 }
 
-fn row_to_status(row: sqlx::postgres::PgRow) -> CommissionPeriodStatusResponse {
+pub(crate) fn row_to_status(row: sqlx::postgres::PgRow) -> CommissionPeriodStatusResponse {
     let period_start: NaiveDate = row.try_get("period_start").unwrap_or_default();
     let period_end: NaiveDate = row.try_get("period_end").unwrap_or_default();
     let partial_paid_at: Option<NaiveDate> = row.try_get("partial_paid_at").ok().flatten();
