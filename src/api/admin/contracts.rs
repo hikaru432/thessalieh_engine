@@ -44,6 +44,8 @@ pub struct ContractResponse {
     pub due_day: i32,
     pub next_due_date: NaiveDate,
     pub approval_at: Option<NaiveDate>,
+    /// Overrides where the recurring monthly schedule anchors (NULL = use approval_at).
+    pub amort_start_date: Option<NaiveDate>,
     pub marketing_representative: String,
     pub agent_code: String,
     pub selling_agent_id: Option<String>,
@@ -130,6 +132,8 @@ pub struct ContractInput {
     pub due_day: i32,
     pub next_due_date: NaiveDate,
     pub approval_at: Option<NaiveDate>,
+    #[serde(default)]
+    pub amort_start_date: Option<NaiveDate>,
     pub marketing_representative: String,
     pub agent_code: String,
     pub selling_agent_id: Option<String>,
@@ -383,7 +387,7 @@ pub(crate) const CONTRACT_COLUMNS_WITH_TOTALS: &str = "
     c.buyer_address, c.buyer_gmail, c.buyer_contact,
     c.lot_block, c.lot_lot, c.lot_area, c.lot_type, c.lot_rate,
     c.contract_price, c.is_promo, c.list_price, c.payment_plan, c.initial_payment, c.term_years, c.term_months, c.monthly_amortization,
-    c.due_day, c.next_due_date, c.approval_at,
+    c.due_day, c.next_due_date, c.approval_at, c.amort_start_date,
     c.marketing_representative, c.agent_code, c.selling_agent_id, c.agent_id,
     c.source_of_buyer, c.other_source,
     c.particulars, c.agent_commission_split_months, c.updated_at,
@@ -490,6 +494,7 @@ pub(crate) fn row_to_contract(row: sqlx::postgres::PgRow) -> ContractResponse {
         due_day: row.try_get("due_day").unwrap_or(15),
         next_due_date,
         approval_at: row.try_get("approval_at").ok().flatten(),
+        amort_start_date: row.try_get("amort_start_date").ok().flatten(),
         marketing_representative: row.try_get("marketing_representative").unwrap_or_default(),
         agent_code: row.try_get("agent_code").unwrap_or_default(),
         selling_agent_id: row.try_get("selling_agent_id").ok().flatten(),
@@ -705,12 +710,12 @@ pub async fn create_contract(
              buyer_address, buyer_gmail, buyer_contact,
              lot_block, lot_lot, lot_area, lot_type, lot_rate,
              contract_price, is_promo, list_price, payment_plan, initial_payment, term_years, term_months, monthly_amortization,
-             due_day, next_due_date, approval_at,
+             due_day, next_due_date, approval_at, amort_start_date,
              marketing_representative, agent_code, selling_agent_id, agent_id,
              source_of_buyer, other_source,
              particulars, agent_commission_split_months, created_at, updated_at
          )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)
       RETURNING id",
     )
     .bind(project_id)
@@ -739,6 +744,7 @@ pub async fn create_contract(
     .bind(p.due_day)
     .bind(p.next_due_date)
     .bind(p.approval_at)
+    .bind(p.amort_start_date)
     .bind(&p.marketing_representative)
     .bind(&p.agent_code)
     .bind(&p.selling_agent_id)
@@ -871,11 +877,11 @@ pub async fn update_contract(
                      buyer_address = $7, buyer_gmail = $8, buyer_contact = $9,
                      lot_block = $10, lot_lot = $11, lot_area = $12, lot_type = $13, lot_rate = $14,
                      contract_price = $15, is_promo = $16, list_price = $17, payment_plan = $18, initial_payment = $19, term_years = $20, term_months = $21,
-                     monthly_amortization = $22, due_day = $23, next_due_date = $24, approval_at = $25,
-                     marketing_representative = $26, agent_code = $27, selling_agent_id = $28, agent_id = $29,
-                     source_of_buyer = $30, other_source = $31, particulars = $32,
-                     agent_commission_split_months = $33, updated_at = $34
-                   WHERE id = $35",
+                     monthly_amortization = $22, due_day = $23, next_due_date = $24, approval_at = $25, amort_start_date = $26,
+                     marketing_representative = $27, agent_code = $28, selling_agent_id = $29, agent_id = $30,
+                     source_of_buyer = $31, other_source = $32, particulars = $33,
+                     agent_commission_split_months = $34, updated_at = $35
+                   WHERE id = $36",
             )
             .bind(p.lot_id)
             .bind(buyer_user_id)
@@ -902,6 +908,7 @@ pub async fn update_contract(
             .bind(p.due_day)
             .bind(p.next_due_date)
             .bind(p.approval_at)
+            .bind(p.amort_start_date)
             .bind(&p.marketing_representative)
             .bind(&p.agent_code)
             .bind(&p.selling_agent_id)
@@ -921,11 +928,11 @@ pub async fn update_contract(
                      lot_id = $1, buyer_user_id = $2, buyer_name = $3, buyer_address = $4, buyer_gmail = $5, buyer_contact = $6,
                      lot_block = $7, lot_lot = $8, lot_area = $9, lot_type = $10, lot_rate = $11,
                      contract_price = $12, is_promo = $13, list_price = $14, payment_plan = $15, initial_payment = $16, term_years = $17, term_months = $18,
-                     monthly_amortization = $19, due_day = $20, next_due_date = $21, approval_at = $22,
-                     marketing_representative = $23, agent_code = $24, selling_agent_id = $25, agent_id = $26,
-                     source_of_buyer = $27, other_source = $28, particulars = $29,
-                     agent_commission_split_months = $30, updated_at = $31
-                   WHERE id = $32",
+                     monthly_amortization = $19, due_day = $20, next_due_date = $21, approval_at = $22, amort_start_date = $23,
+                     marketing_representative = $24, agent_code = $25, selling_agent_id = $26, agent_id = $27,
+                     source_of_buyer = $28, other_source = $29, particulars = $30,
+                     agent_commission_split_months = $31, updated_at = $32
+                   WHERE id = $33",
             )
             .bind(p.lot_id)
             .bind(buyer_user_id)
@@ -949,6 +956,7 @@ pub async fn update_contract(
             .bind(p.due_day)
             .bind(p.next_due_date)
             .bind(p.approval_at)
+            .bind(p.amort_start_date)
             .bind(&p.marketing_representative)
             .bind(&p.agent_code)
             .bind(&p.selling_agent_id)

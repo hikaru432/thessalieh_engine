@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use crate::api::admin::{
-    commission_rates, commission_row_meta, commission_status, company, contracts, lots, projects,
-    roster, upline_role_types,
+    commission_rates, commission_row_meta, commission_split_schedule, commission_status, company,
+    contracts, lots, projects, roster, upline_role_types,
 };
 use crate::api::buyer;
 use crate::api::leadbroker;
@@ -180,6 +180,15 @@ pub fn routes() -> Router {
             "/upline-role-types/{slug}",
             patch(upline_role_types::update_upline_role_type)
                 .delete(upline_role_types::delete_upline_role_type),
+        )
+        .route(
+            "/commission-split-schedule",
+            get(commission_split_schedule::list_commission_split_schedule)
+                .post(commission_split_schedule::create_commission_split_schedule),
+        )
+        .route(
+            "/commission-split-schedule/{id}",
+            axum::routing::delete(commission_split_schedule::delete_commission_split_schedule),
         )
         .route(
             "/projects",
