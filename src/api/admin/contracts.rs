@@ -58,6 +58,9 @@ pub struct ContractResponse {
     pub status: String,
     pub agent_commission_split_months: i32,
     pub updated_at: i64,
+    /// Unpaid installments due on or before this date are exempt from the 3%/month
+    /// late penalty (see PATCH /contracts/{id}/penalty-waiver). NULL = no waiver.
+    pub penalty_waived_through_due_date: Option<NaiveDate>,
 }
 
 #[derive(Serialize)]
@@ -513,7 +516,7 @@ pub(crate) const CONTRACT_COLUMNS_WITH_TOTALS: &str = "
     c.due_day, c.next_due_date, c.approval_at, c.amort_start_date,
     c.marketing_representative, c.agent_code, c.selling_agent_id, c.agent_id,
     c.source_of_buyer, c.other_source,
-    c.particulars, c.agent_commission_split_months, c.updated_at,
+    c.particulars, c.agent_commission_split_months, c.updated_at, c.penalty_waived_through_due_date,
     COALESCE(SUM(p.amount), 0) AS total_paid";
 
 async fn validate_buyer_user(
@@ -632,6 +635,10 @@ pub(crate) fn row_to_contract(row: sqlx::postgres::PgRow) -> ContractResponse {
             .try_get("agent_commission_split_months")
             .unwrap_or(36),
         updated_at: row.try_get("updated_at").unwrap_or(0),
+        penalty_waived_through_due_date: row
+            .try_get("penalty_waived_through_due_date")
+            .ok()
+            .flatten(),
     }
 }
 
@@ -987,6 +994,52 @@ pub async fn update_contract(
         ResolvedBuyerNames::Legacy { buyer_name } => buyer_name.clone(),
     };
 
+    // Recompute next_due_date from the (possibly just-edited) schedule fields +
+    // existing payment history, instead of trusting the client's `next_due_date` —
+    // otherwise fixing a mistaken approval_at / due_day here leaves next_due_date
+    // stuck at whatever it was anchored to before the correction.
+    let schedule_payment_rows = sqlx::query(
+        "SELECT amount, paid_at, months_covered FROM public.payments WHERE contract_id = $1",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+    })?;
+    let schedule_anchor = p
+        .amort_start_date
+        .or(p.approval_at)
+        .unwrap_or_else(|| Utc::now().date_naive());
+    let schedule_total_months = if p.term_months > 0 {
+        p.term_months
+    } else if p.term_years > 0 {
+        p.term_years * 12
+    } else {
+        1
+    };
+    let schedule_payments: Vec<(f64, NaiveDate, i32)> = schedule_payment_rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<f64, _>("amount").unwrap_or(0.0),
+                r.try_get::<NaiveDate, _>("paid_at").unwrap_or(schedule_anchor),
+                r.try_get::<i32, _>("months_covered").unwrap_or(1),
+            )
+        })
+        .collect();
+    let next_due_date = compute_next_unpaid_due_date(
+        schedule_anchor,
+        p.due_day,
+        p.initial_payment,
+        p.approval_at,
+        p.monthly_amortization,
+        schedule_total_months,
+        &schedule_payments,
+    )
+    .unwrap_or(p.next_due_date);
+
     let updated = match names {
         ResolvedBuyerNames::FromParts {
             buyer_name,
@@ -1029,7 +1082,7 @@ pub async fn update_contract(
             .bind(p.term_months)
             .bind(p.monthly_amortization)
             .bind(p.due_day)
-            .bind(p.next_due_date)
+            .bind(next_due_date)
             .bind(p.approval_at)
             .bind(p.amort_start_date)
             .bind(&p.marketing_representative)
@@ -1077,7 +1130,7 @@ pub async fn update_contract(
             .bind(p.term_months)
             .bind(p.monthly_amortization)
             .bind(p.due_day)
-            .bind(p.next_due_date)
+            .bind(next_due_date)
             .bind(p.approval_at)
             .bind(p.amort_start_date)
             .bind(&p.marketing_representative)
@@ -1370,4 +1423,42 @@ pub async fn delete_contract(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct PenaltyWaiverInput {
+    /// Unpaid installments due on or before this date are exempt from the late
+    /// penalty. Pass null to clear an existing waiver.
+    pub waived_through_due_date: Option<NaiveDate>,
+}
+
+pub async fn update_penalty_waiver(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(p): Json<PenaltyWaiverInput>,
+) -> Result<Json<ContractResponse>, E> {
+    require_admin(&pool, &headers).await?;
+
+    let now = Utc::now().timestamp();
+    let result = sqlx::query(
+        "UPDATE public.contracts SET penalty_waived_through_due_date = $1, updated_at = $2 WHERE id = $3",
+    )
+    .bind(p.waived_through_due_date)
+    .bind(now)
+    .bind(id)
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to update penalty waiver")
+    })?;
+
+    if result.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "Contract not found"));
+    }
+
+    get_contract(Extension(pool), headers, Path(id))
+        .await
+        .map(|Json(detail)| Json(detail.contract))
 }

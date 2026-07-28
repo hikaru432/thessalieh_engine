@@ -234,6 +234,10 @@ pub fn routes() -> Router {
             "/contracts/{id}/payments",
             post(contracts::record_payment),
         )
+        .route(
+            "/contracts/{id}/penalty-waiver",
+            patch(contracts::update_penalty_waiver),
+        )
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES));
 
     Router::new().merge(auth_routes).merge(data_routes)
