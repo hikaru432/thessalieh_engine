@@ -14,12 +14,10 @@ pub fn spawn(pool: PgPool) {
             ticker.tick().await;
             let now = Utc::now().timestamp();
 
-            match sqlx::query!(
-                "DELETE FROM public.verification_codes WHERE expires_at <= $1",
-                now
-            )
-            .execute(&pool)
-            .await
+            match sqlx::query("DELETE FROM public.verification_codes WHERE expires_at <= $1")
+                .bind(now)
+                .execute(&pool)
+                .await
             {
                 Ok(r) if r.rows_affected() > 0 => {
                     tracing::info!(purged = r.rows_affected(), "gc: expired verification codes");
@@ -28,7 +26,8 @@ pub fn spawn(pool: PgPool) {
                 Err(e) => tracing::error!("gc verification_codes: {e}"),
             }
 
-            match sqlx::query!("DELETE FROM public.sessions WHERE expires_at <= $1", now)
+            match sqlx::query("DELETE FROM public.sessions WHERE expires_at <= $1")
+                .bind(now)
                 .execute(&pool)
                 .await
             {

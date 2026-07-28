@@ -12,12 +12,15 @@ use super::shared::{
 };
 use crate::api::verified::Verified;
 
-// Per-username lockout tuning: 5 bad attempts → 15-minute lockout.
+// Per-account lockout tuning: 5 bad attempts → 15-minute lockout.
 const MAX_FAILED_ATTEMPTS: i32 = 5;
 const LOCKOUT_SECONDS: i64 = 15 * 60;
 
 #[derive(Deserialize)]
 struct LoginInput {
+    /// Username *or* email. Named `username` for wire compatibility with the
+    /// existing client; the aliases let newer callers be explicit.
+    #[serde(alias = "email", alias = "identifier")]
     username: String,
     password: String,
 }
@@ -31,18 +34,32 @@ pub async fn login(
 
     let now = Utc::now().timestamp();
 
+    // Users registered through `insert_user` start with `email = ''`, so a blank
+    // identifier would match every one of them via the email arm below. Reject it
+    // before it ever reaches the query.
+    let identifier = p.username.trim();
+    if identifier.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid credentials"));
+    }
+
+    // Accept either the username (exact, as stored) or the email (case-insensitive,
+    // since email is case-insensitive in practice). If some account's username
+    // happens to equal another's email, the exact username match wins.
     let row = sqlx::query(
         "SELECT id, username, email, phone, password_hash, role, failed_login_attempts, lockout_until
-         FROM public.users WHERE username = $1",
+         FROM public.users
+         WHERE username = $1 OR lower(email) = lower($1)
+         ORDER BY (username = $1) DESC
+         LIMIT 1",
     )
-    .bind(&p.username)
+    .bind(identifier)
     .fetch_optional(&pool)
     .await
     .map_err(|e| {
         tracing::error!("DB: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "Login failed")
     })?
-    .ok_or((StatusCode::UNAUTHORIZED, "Invalid username or password"))?;
+    .ok_or((StatusCode::UNAUTHORIZED, "Invalid credentials"))?;
 
     let user_id: uuid::Uuid = row.try_get("id").map_err(|e| {
         tracing::error!("DB login row id: {e}");
@@ -81,7 +98,7 @@ pub async fn login(
             .bind(now + LOCKOUT_SECONDS)
             .execute(&pool)
             .await;
-            tracing::warn!(username = %p.username, "account locked after repeated failed logins");
+            tracing::warn!(%username, "account locked after repeated failed logins");
         } else {
             let _ = sqlx::query(
                 "UPDATE public.users SET failed_login_attempts = $2 WHERE id = $1",
@@ -91,7 +108,7 @@ pub async fn login(
             .execute(&pool)
             .await;
         }
-        return Err((StatusCode::UNAUTHORIZED, "Invalid username or password"));
+        return Err((StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
 
     if failed_login_attempts != 0 || lockout_until != 0 {
@@ -127,7 +144,7 @@ pub async fn login(
         (StatusCode::INTERNAL_SERVER_ERROR, "Session creation failed")
     })?;
 
-    tracing::info!(username = %p.username, user_id = %user_id, "user logged in");
+    tracing::info!(%username, %user_id, "user logged in");
 
     let mut headers = HeaderMap::new();
     let csrf_token = new_csrf_token();
