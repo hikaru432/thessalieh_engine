@@ -38,11 +38,14 @@ pub fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
+// Cookies are Secure + SameSite=None by default so a cross-origin frontend
+// (e.g. Vercel) can always send them back. Local dev over plain HTTP can't
+// set Secure cookies at all, so it opts out explicitly via COOKIE_INSECURE_LOCAL_DEV.
 fn cookie_security_attrs() -> &'static str {
-    if std::env::var("COOKIE_SECURE").is_ok() {
-        "SameSite=None; Secure"
-    } else {
+    if std::env::var("COOKIE_INSECURE_LOCAL_DEV").is_ok() {
         "SameSite=Lax"
+    } else {
+        "SameSite=None; Secure"
     }
 }
 

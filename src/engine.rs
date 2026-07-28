@@ -5,27 +5,6 @@ mod routes;
 use std::{env, sync::Arc, time::Duration};
 
 use axum::http::HeaderValue;
-
-fn build_cors_origins(raw: &str) -> Vec<HeaderValue> {
-    let mut origins: Vec<HeaderValue> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            HeaderValue::from_str(s).unwrap_or_else(|_| panic!("Invalid CLIENT_URL entry: {s}"))
-        })
-        .collect();
-
-    if let Some(origin) = origins.iter().find(|value| value.to_str().unwrap_or_default().starts_with("http://localhost:")) {
-        let origin_str = origin.to_str().unwrap_or_default();
-        let loopback_origin = origin_str.replace("localhost", "127.0.0.1");
-        if !origins.iter().any(|value| value.to_str().unwrap_or_default() == loopback_origin) {
-            origins.push(HeaderValue::from_str(&loopback_origin).expect("valid loopback origin"));
-        }
-    }
-
-    origins
-}
 use axum::{
     extract::Extension,
     http::Method,
@@ -58,7 +37,14 @@ async fn main() {
 
     let client_url_raw =
         env::var("CLIENT_URL").unwrap_or_else(|_| "http://localhost:5173".to_string());
-    let origins = build_cors_origins(&client_url_raw);
+    let origins: Vec<HeaderValue> = client_url_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            HeaderValue::from_str(s).unwrap_or_else(|_| panic!("Invalid CLIENT_URL entry: {s}"))
+        })
+        .collect();
 
     if origins.is_empty() {
         panic!("CLIENT_URL must contain at least one origin");
@@ -149,18 +135,4 @@ async fn main() {
     )
     .await
     .unwrap();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn expands_loopback_origins_for_local_dev() {
-        let origins = build_cors_origins("http://localhost:5173");
-        let values: Vec<String> = origins.into_iter().map(|value| value.to_str().unwrap().to_string()).collect();
-
-        assert!(values.contains(&"http://localhost:5173".to_string()));
-        assert!(values.contains(&"http://127.0.0.1:5173".to_string()));
-    }
 }
