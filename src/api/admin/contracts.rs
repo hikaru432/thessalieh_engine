@@ -3,7 +3,7 @@ use axum::{
     extract::Path,
     http::{HeaderMap, StatusCode},
 };
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -275,14 +275,137 @@ fn last_day_of_month(year: i32, month: u32) -> u32 {
         .day()
 }
 
-/// Adds `months` to `date`, clamping the day to the target month's length
-/// (matches the frontend's `addMonths` helper).
-fn add_months(date: NaiveDate, months: i32) -> NaiveDate {
-    let total = date.year() * 12 + date.month() as i32 - 1 + months;
-    let year = total.div_euclid(12);
-    let month = (total.rem_euclid(12) + 1) as u32;
-    let last_day = last_day_of_month(year, month);
-    NaiveDate::from_ymd_opt(year, month, date.day().min(last_day)).unwrap()
+// ---------------------------------------------------------------------------
+// Installment schedule math — MUST stay in sync with the frontend's
+// `installmentDueDate` / `nextUnpaidDueDate` in
+// thessalieh-property/src/pages/admin/tracking/trackingHelpers.ts.
+//
+// A buyer whose first monthly amortization is recorded on the approval date
+// itself (no separate down payment) has installment 1 due that same day;
+// installment 2 must then land a full calendar month later, never reusing
+// "next occurring due day" logic (which can fall just days after approval if
+// due_day hasn't passed yet that month).
+// ---------------------------------------------------------------------------
+
+fn month_index(date: NaiveDate) -> i32 {
+    date.year() * 12 + date.month() as i32 - 1
+}
+
+fn date_at_month_index(total_month_index: i32, due_day: i32) -> NaiveDate {
+    let year = total_month_index.div_euclid(12);
+    let month = (total_month_index.rem_euclid(12) + 1) as u32;
+    let last = last_day_of_month(year, month);
+    let day = due_day.clamp(1, 31) as u32;
+    NaiveDate::from_ymd_opt(year, month, day.min(last)).unwrap()
+}
+
+/// Calendar due date for installment `installment_index` (1-based).
+fn installment_due_date(
+    anchor: NaiveDate,
+    due_day: i32,
+    initial_payment: f64,
+    installment_index: i32,
+) -> NaiveDate {
+    let due_day = due_day.clamp(1, 31);
+    let first_amort_on_approval = initial_payment <= 0.0;
+
+    if first_amort_on_approval && installment_index == 1 {
+        return anchor;
+    }
+
+    if first_amort_on_approval {
+        let idx = month_index(anchor) + 1 + (installment_index - 2);
+        return date_at_month_index(idx, due_day);
+    }
+
+    let first_due_idx = if due_day > anchor.day() as i32 {
+        month_index(anchor)
+    } else {
+        month_index(anchor) + 1
+    };
+    date_at_month_index(first_due_idx + (installment_index - 1), due_day)
+}
+
+fn build_installment_schedule(
+    anchor: NaiveDate,
+    due_day: i32,
+    initial_payment: f64,
+    total_months: i32,
+) -> Vec<NaiveDate> {
+    if total_months <= 0 {
+        return Vec::new();
+    }
+    (1..=total_months)
+        .map(|i| installment_due_date(anchor, due_day, initial_payment, i))
+        .collect()
+}
+
+/// The auto-recorded down payment (months_covered = 0, amount == initial_payment,
+/// paid on the approval date) doesn't consume a recurring installment slot.
+fn is_opening_down_payment(
+    initial_payment: f64,
+    approval_at: Option<NaiveDate>,
+    amount: f64,
+    paid_at: NaiveDate,
+) -> bool {
+    initial_payment > 0.0 && (amount - initial_payment).abs() < 1e-6 && approval_at == Some(paid_at)
+}
+
+fn is_paid_amount(amount: f64, monthly_amort: f64) -> bool {
+    if monthly_amort <= 0.0 {
+        amount > 0.0
+    } else {
+        amount >= monthly_amort * 0.95
+    }
+}
+
+/// Due date of the next installment that isn't fully paid yet (None = fully
+/// paid off, or no monthly schedule). Computed fresh from the whole payment
+/// history every time, so a late-but-same-month payment correctly advances
+/// the due date and any prior drift self-heals instead of compounding.
+fn compute_next_unpaid_due_date(
+    anchor: NaiveDate,
+    due_day: i32,
+    initial_payment: f64,
+    approval_at: Option<NaiveDate>,
+    monthly_amort: f64,
+    total_months: i32,
+    payments: &[(f64, NaiveDate, i32)],
+) -> Option<NaiveDate> {
+    let schedule = build_installment_schedule(anchor, due_day, initial_payment, total_months);
+    if schedule.is_empty() {
+        return None;
+    }
+
+    let mut paid = vec![false; schedule.len()];
+    let mut recurring: Vec<&(f64, NaiveDate, i32)> = payments
+        .iter()
+        .filter(|(amount, paid_at, _)| {
+            !is_opening_down_payment(initial_payment, approval_at, *amount, *paid_at)
+        })
+        .collect();
+    recurring.sort_by_key(|(_, paid_at, _)| *paid_at);
+
+    let mut cursor = 0usize;
+    for (amount, _, months_covered) in recurring {
+        let covers = if *months_covered == 0 {
+            1
+        } else {
+            (*months_covered).max(1) as usize
+        };
+        let per_installment = amount / covers as f64;
+        for _ in 0..covers {
+            if cursor >= paid.len() {
+                break;
+            }
+            if is_paid_amount(per_installment, monthly_amort) {
+                paid[cursor] = true;
+            }
+            cursor += 1;
+        }
+    }
+
+    paid.iter().position(|p| !p).map(|idx| schedule[idx])
 }
 
 fn format_buyer_name(last: &str, first: &str, middle: &str) -> String {
@@ -1031,7 +1154,9 @@ pub async fn record_payment(
         normalize_payment_meta(&p)?;
 
     let row = sqlx::query(
-        "SELECT lot_id, buyer_name, payment_plan, contract_price, next_due_date
+        "SELECT lot_id, buyer_name, payment_plan, contract_price, next_due_date,
+                due_day, initial_payment, approval_at, amort_start_date,
+                monthly_amortization, term_years, term_months, updated_at
            FROM public.contracts WHERE id = $1",
     )
     .bind(id)
@@ -1050,12 +1175,14 @@ pub async fn record_payment(
     let current_due_date: NaiveDate = row
         .try_get("next_due_date")
         .unwrap_or_else(|_| Utc::now().date_naive());
-    // months_covered == 0: amort paid on approval (cash only) — keep next unpaid preferred due
-    let next_due_date = if p.months_covered == 0 {
-        current_due_date
-    } else {
-        add_months(current_due_date, p.months_covered)
-    };
+    let due_day: i32 = row.try_get("due_day").unwrap_or(15);
+    let initial_payment: f64 = row.try_get("initial_payment").unwrap_or(0.0);
+    let approval_at: Option<NaiveDate> = row.try_get("approval_at").ok().flatten();
+    let amort_start_date: Option<NaiveDate> = row.try_get("amort_start_date").ok().flatten();
+    let monthly_amortization: f64 = row.try_get("monthly_amortization").unwrap_or(0.0);
+    let term_years: i32 = row.try_get("term_years").unwrap_or(0);
+    let term_months: i32 = row.try_get("term_months").unwrap_or(0);
+    let updated_at_ts: i64 = row.try_get("updated_at").unwrap_or(0);
 
     sqlx::query(
         "INSERT INTO public.payments (
@@ -1080,6 +1207,55 @@ pub async fn record_payment(
         tracing::error!("DB: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to record payment")
     })?;
+
+    // Recompute next_due_date from the whole schedule + payment history (source of
+    // truth) instead of blindly advancing by months_covered — this is what credits
+    // a late-but-same-month payment correctly and self-heals any prior drift.
+    let anchor = amort_start_date.or(approval_at).unwrap_or_else(|| {
+        DateTime::from_timestamp(updated_at_ts, 0)
+            .map(|dt| dt.date_naive())
+            .unwrap_or_else(|| Utc::now().date_naive())
+    });
+    let total_months = if term_months > 0 {
+        term_months
+    } else if term_years > 0 {
+        term_years * 12
+    } else {
+        1
+    };
+
+    let payment_rows = sqlx::query(
+        "SELECT amount, paid_at, months_covered FROM public.payments WHERE contract_id = $1",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+    })?;
+
+    let payments_for_schedule: Vec<(f64, NaiveDate, i32)> = payment_rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<f64, _>("amount").unwrap_or(0.0),
+                r.try_get::<NaiveDate, _>("paid_at").unwrap_or(anchor),
+                r.try_get::<i32, _>("months_covered").unwrap_or(1),
+            )
+        })
+        .collect();
+
+    let next_due_date = compute_next_unpaid_due_date(
+        anchor,
+        due_day,
+        initial_payment,
+        approval_at,
+        monthly_amortization,
+        total_months,
+        &payments_for_schedule,
+    )
+    .unwrap_or(current_due_date);
 
     let now = Utc::now().timestamp();
     sqlx::query(
