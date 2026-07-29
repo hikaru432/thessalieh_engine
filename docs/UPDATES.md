@@ -166,7 +166,7 @@ Per buyer / agent row on a biweek:
 ### Buyer account (breaking)
 
 - Create requires `buyer_user_id` — user must have role `User`
-- One buyer account per project
+- A buyer account may hold multiple contracts within the same project (multiple lots per buyer)
 - Structured names required: `buyer_last_name`, `buyer_first_name`, `buyer_middle_name`
 - Responses can include `buyer_username`
 

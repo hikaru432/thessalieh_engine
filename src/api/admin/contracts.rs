@@ -519,12 +519,7 @@ pub(crate) const CONTRACT_COLUMNS_WITH_TOTALS: &str = "
     c.particulars, c.agent_commission_split_months, c.updated_at, c.penalty_waived_through_due_date,
     COALESCE(SUM(p.amount), 0) AS total_paid";
 
-async fn validate_buyer_user(
-    pool: &PgPool,
-    buyer_user_id: Uuid,
-    project_id: Uuid,
-    exclude_contract_id: Option<Uuid>,
-) -> Result<(), E> {
+async fn validate_buyer_user(pool: &PgPool, buyer_user_id: Uuid) -> Result<(), E> {
     let row = sqlx::query("SELECT role FROM public.users WHERE id = $1")
         .bind(buyer_user_id)
         .fetch_optional(pool)
@@ -547,28 +542,6 @@ async fn validate_buyer_user(
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "Selected account cannot be used as a buyer",
-        ));
-    }
-
-    let duplicate = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM public.contracts
-          WHERE project_id = $1 AND buyer_user_id = $2 AND ($3::uuid IS NULL OR id != $3)
-          LIMIT 1",
-    )
-    .bind(project_id)
-    .bind(buyer_user_id)
-    .bind(exclude_contract_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to validate buyer account")
-    })?;
-
-    if duplicate.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            "Buyer already has a contract in this project",
         ));
     }
 
@@ -814,7 +787,7 @@ pub async fn create_contract(
     let buyer_user_id = p
         .buyer_user_id
         .ok_or((StatusCode::UNPROCESSABLE_ENTITY, "Buyer account is required"))?;
-    validate_buyer_user(&pool, buyer_user_id, project_id, None).await?;
+    validate_buyer_user(&pool, buyer_user_id).await?;
     let names = resolve_buyer_names(&p)?;
     let (buyer_name, buyer_last_name, buyer_first_name, buyer_middle_name) = match names {
         ResolvedBuyerNames::FromParts {
@@ -961,18 +934,7 @@ pub async fn update_contract(
         .buyer_user_id
         .ok_or((StatusCode::UNPROCESSABLE_ENTITY, "Buyer account is required"))?;
 
-    let project_id: Uuid =
-        sqlx::query_scalar("SELECT project_id FROM public.contracts WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| {
-                tracing::error!("DB: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
-            })?
-            .ok_or((StatusCode::NOT_FOUND, "Contract not found"))?;
-
-    validate_buyer_user(&pool, buyer_user_id, project_id, Some(id)).await?;
+    validate_buyer_user(&pool, buyer_user_id).await?;
     let names = resolve_buyer_names(&p)?;
 
     let previous_lot_id: Option<Uuid> =
