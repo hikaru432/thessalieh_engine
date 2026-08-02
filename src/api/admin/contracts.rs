@@ -46,6 +46,10 @@ pub struct ContractResponse {
     pub approval_at: Option<NaiveDate>,
     /// Overrides where the recurring monthly schedule anchors (NULL = use approval_at).
     pub amort_start_date: Option<NaiveDate>,
+    /// Custom expected amount for installment #1 only (the "Preferred amount" option
+    /// in AddClientDetails). NULL = installment #1 uses monthly_amortization like
+    /// every other slot.
+    pub first_installment_amount: Option<f64>,
     pub marketing_representative: String,
     pub agent_code: String,
     pub selling_agent_id: Option<String>,
@@ -137,6 +141,8 @@ pub struct ContractInput {
     pub approval_at: Option<NaiveDate>,
     #[serde(default)]
     pub amort_start_date: Option<NaiveDate>,
+    #[serde(default)]
+    pub first_installment_amount: Option<f64>,
     pub marketing_representative: String,
     pub agent_code: String,
     pub selling_agent_id: Option<String>,
@@ -202,6 +208,23 @@ pub struct RecordPaymentInput {
     pub months_covered: i32,
     pub paid_at: NaiveDate,
     pub particulars: String,
+    #[serde(default)]
+    pub reference_no: String,
+    #[serde(default)]
+    pub bank_name: String,
+    #[serde(default)]
+    pub sender_name: String,
+    #[serde(default)]
+    pub receiver_name: String,
+    #[serde(default)]
+    pub mode_label: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdatePaymentInput {
+    pub amount: f64,
+    pub method: String,
+    pub paid_at: NaiveDate,
     #[serde(default)]
     pub reference_no: String,
     #[serde(default)]
@@ -362,6 +385,25 @@ fn is_paid_amount(amount: f64, monthly_amort: f64) -> bool {
     }
 }
 
+/// The amount expected for a given installment slot (0-based). Installment #1
+/// (index 0) uses `first_installment_amount` when the contract has a "Preferred
+/// amount" override set; every other slot (and "Half payment" contracts, which
+/// deliberately leave `first_installment_amount` NULL) uses `monthly_amort`.
+fn expected_installment_amount(
+    installment_idx: usize,
+    monthly_amort: f64,
+    first_installment_amount: Option<f64>,
+) -> f64 {
+    if installment_idx == 0 {
+        if let Some(amt) = first_installment_amount {
+            if amt > 0.0 {
+                return amt;
+            }
+        }
+    }
+    monthly_amort
+}
+
 /// Due date of the next installment that isn't fully paid yet (None = fully
 /// paid off, or no monthly schedule). Computed fresh from the whole payment
 /// history every time, so a late-but-same-month payment correctly advances
@@ -372,6 +414,7 @@ fn compute_next_unpaid_due_date(
     initial_payment: f64,
     approval_at: Option<NaiveDate>,
     monthly_amort: f64,
+    first_installment_amount: Option<f64>,
     total_months: i32,
     payments: &[(f64, NaiveDate, i32)],
 ) -> Option<NaiveDate> {
@@ -401,7 +444,8 @@ fn compute_next_unpaid_due_date(
             if cursor >= paid.len() {
                 break;
             }
-            if is_paid_amount(per_installment, monthly_amort) {
+            let expected = expected_installment_amount(cursor, monthly_amort, first_installment_amount);
+            if is_paid_amount(per_installment, expected) {
                 paid[cursor] = true;
             }
             cursor += 1;
@@ -504,6 +548,21 @@ fn validate_contract_input(p: &ContractInput) -> Result<(), E> {
             "Agent commission split months must be between 1 and 120",
         ));
     }
+    if let Some(amt) = p.first_installment_amount {
+        if amt <= 0.0 {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "First installment amount must be greater than zero",
+            ));
+        }
+        let total_months = if p.term_months > 0 { p.term_months } else { p.term_years * 12 };
+        if total_months < 2 {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "First installment amount requires at least 2 installment months",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -513,7 +572,7 @@ pub(crate) const CONTRACT_COLUMNS_WITH_TOTALS: &str = "
     c.buyer_address, c.buyer_gmail, c.buyer_contact,
     c.lot_block, c.lot_lot, c.lot_area, c.lot_type, c.lot_rate,
     c.contract_price, c.is_promo, c.list_price, c.payment_plan, c.initial_payment, c.term_years, c.term_months, c.monthly_amortization,
-    c.due_day, c.next_due_date, c.approval_at, c.amort_start_date,
+    c.due_day, c.next_due_date, c.approval_at, c.amort_start_date, c.first_installment_amount,
     c.marketing_representative, c.agent_code, c.selling_agent_id, c.agent_id,
     c.source_of_buyer, c.other_source,
     c.particulars, c.agent_commission_split_months, c.updated_at, c.penalty_waived_through_due_date,
@@ -594,6 +653,7 @@ pub(crate) fn row_to_contract(row: sqlx::postgres::PgRow) -> ContractResponse {
         next_due_date,
         approval_at: row.try_get("approval_at").ok().flatten(),
         amort_start_date: row.try_get("amort_start_date").ok().flatten(),
+        first_installment_amount: row.try_get("first_installment_amount").ok().flatten(),
         marketing_representative: row.try_get("marketing_representative").unwrap_or_default(),
         agent_code: row.try_get("agent_code").unwrap_or_default(),
         selling_agent_id: row.try_get("selling_agent_id").ok().flatten(),
@@ -806,6 +866,14 @@ pub async fn create_contract(
 
     let now = Utc::now().timestamp();
     let (contract_price, list_price, is_promo) = resolve_contract_prices(&p)?;
+    if let Some(amt) = p.first_installment_amount
+        && amt > contract_price - p.initial_payment + 1e-6
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "First installment amount cannot exceed the financed balance",
+        ));
+    }
 
     let row = sqlx::query(
         "INSERT INTO public.contracts (
@@ -813,12 +881,12 @@ pub async fn create_contract(
              buyer_address, buyer_gmail, buyer_contact,
              lot_block, lot_lot, lot_area, lot_type, lot_rate,
              contract_price, is_promo, list_price, payment_plan, initial_payment, term_years, term_months, monthly_amortization,
-             due_day, next_due_date, approval_at, amort_start_date,
+             due_day, next_due_date, approval_at, amort_start_date, first_installment_amount,
              marketing_representative, agent_code, selling_agent_id, agent_id,
              source_of_buyer, other_source,
              particulars, agent_commission_split_months, created_at, updated_at
          )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38)
       RETURNING id",
     )
     .bind(project_id)
@@ -848,6 +916,7 @@ pub async fn create_contract(
     .bind(p.next_due_date)
     .bind(p.approval_at)
     .bind(p.amort_start_date)
+    .bind(p.first_installment_amount)
     .bind(&p.marketing_representative)
     .bind(&p.agent_code)
     .bind(&p.selling_agent_id)
@@ -950,6 +1019,14 @@ pub async fn update_contract(
 
     let now = Utc::now().timestamp();
     let (contract_price, list_price, is_promo) = resolve_contract_prices(&p)?;
+    if let Some(amt) = p.first_installment_amount
+        && amt > contract_price - p.initial_payment + 1e-6
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "First installment amount cannot exceed the financed balance",
+        ));
+    }
 
     let buyer_name_for_sync = match &names {
         ResolvedBuyerNames::FromParts { buyer_name, .. } => buyer_name.clone(),
@@ -997,6 +1074,7 @@ pub async fn update_contract(
         p.initial_payment,
         p.approval_at,
         p.monthly_amortization,
+        p.first_installment_amount,
         schedule_total_months,
         &schedule_payments,
     )
@@ -1015,11 +1093,11 @@ pub async fn update_contract(
                      buyer_address = $7, buyer_gmail = $8, buyer_contact = $9,
                      lot_block = $10, lot_lot = $11, lot_area = $12, lot_type = $13, lot_rate = $14,
                      contract_price = $15, is_promo = $16, list_price = $17, payment_plan = $18, initial_payment = $19, term_years = $20, term_months = $21,
-                     monthly_amortization = $22, due_day = $23, next_due_date = $24, approval_at = $25, amort_start_date = $26,
-                     marketing_representative = $27, agent_code = $28, selling_agent_id = $29, agent_id = $30,
-                     source_of_buyer = $31, other_source = $32, particulars = $33,
-                     agent_commission_split_months = $34, updated_at = $35
-                   WHERE id = $36",
+                     monthly_amortization = $22, due_day = $23, next_due_date = $24, approval_at = $25, amort_start_date = $26, first_installment_amount = $27,
+                     marketing_representative = $28, agent_code = $29, selling_agent_id = $30, agent_id = $31,
+                     source_of_buyer = $32, other_source = $33, particulars = $34,
+                     agent_commission_split_months = $35, updated_at = $36
+                   WHERE id = $37",
             )
             .bind(p.lot_id)
             .bind(buyer_user_id)
@@ -1047,6 +1125,7 @@ pub async fn update_contract(
             .bind(next_due_date)
             .bind(p.approval_at)
             .bind(p.amort_start_date)
+            .bind(p.first_installment_amount)
             .bind(&p.marketing_representative)
             .bind(&p.agent_code)
             .bind(&p.selling_agent_id)
@@ -1066,11 +1145,11 @@ pub async fn update_contract(
                      lot_id = $1, buyer_user_id = $2, buyer_name = $3, buyer_address = $4, buyer_gmail = $5, buyer_contact = $6,
                      lot_block = $7, lot_lot = $8, lot_area = $9, lot_type = $10, lot_rate = $11,
                      contract_price = $12, is_promo = $13, list_price = $14, payment_plan = $15, initial_payment = $16, term_years = $17, term_months = $18,
-                     monthly_amortization = $19, due_day = $20, next_due_date = $21, approval_at = $22, amort_start_date = $23,
-                     marketing_representative = $24, agent_code = $25, selling_agent_id = $26, agent_id = $27,
-                     source_of_buyer = $28, other_source = $29, particulars = $30,
-                     agent_commission_split_months = $31, updated_at = $32
-                   WHERE id = $33",
+                     monthly_amortization = $19, due_day = $20, next_due_date = $21, approval_at = $22, amort_start_date = $23, first_installment_amount = $24,
+                     marketing_representative = $25, agent_code = $26, selling_agent_id = $27, agent_id = $28,
+                     source_of_buyer = $29, other_source = $30, particulars = $31,
+                     agent_commission_split_months = $32, updated_at = $33
+                   WHERE id = $34",
             )
             .bind(p.lot_id)
             .bind(buyer_user_id)
@@ -1095,6 +1174,7 @@ pub async fn update_contract(
             .bind(next_due_date)
             .bind(p.approval_at)
             .bind(p.amort_start_date)
+            .bind(p.first_installment_amount)
             .bind(&p.marketing_representative)
             .bind(&p.agent_code)
             .bind(&p.selling_agent_id)
@@ -1171,7 +1251,7 @@ pub async fn record_payment(
     let row = sqlx::query(
         "SELECT lot_id, buyer_name, payment_plan, contract_price, next_due_date,
                 due_day, initial_payment, approval_at, amort_start_date,
-                monthly_amortization, term_years, term_months, updated_at
+                monthly_amortization, first_installment_amount, term_years, term_months, updated_at
            FROM public.contracts WHERE id = $1",
     )
     .bind(id)
@@ -1195,6 +1275,7 @@ pub async fn record_payment(
     let approval_at: Option<NaiveDate> = row.try_get("approval_at").ok().flatten();
     let amort_start_date: Option<NaiveDate> = row.try_get("amort_start_date").ok().flatten();
     let monthly_amortization: f64 = row.try_get("monthly_amortization").unwrap_or(0.0);
+    let first_installment_amount: Option<f64> = row.try_get("first_installment_amount").ok().flatten();
     let term_years: i32 = row.try_get("term_years").unwrap_or(0);
     let term_months: i32 = row.try_get("term_months").unwrap_or(0);
     let updated_at_ts: i64 = row.try_get("updated_at").unwrap_or(0);
@@ -1267,6 +1348,7 @@ pub async fn record_payment(
         initial_payment,
         approval_at,
         monthly_amortization,
+        first_installment_amount,
         total_months,
         &payments_for_schedule,
     )
@@ -1335,6 +1417,176 @@ pub async fn list_project_payments(
     })?;
 
     Ok(Json(rows.into_iter().map(row_to_cashflow_payment).collect()))
+}
+
+/// Corrects a Cash Flow entry after the fact (wrong mode/amount/date typed in). Since
+/// the date can move, this replays the due-date schedule exactly like `record_payment`
+/// does, and also re-syncs the lot's fully-paid flag since the correction can cross
+/// that threshold.
+pub async fn update_payment(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(p): Json<UpdatePaymentInput>,
+) -> Result<Json<PaymentResponse>, E> {
+    require_admin(&pool, &headers).await?;
+
+    if !PAYMENT_METHODS.contains(&p.method.as_str()) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "Invalid payment method"));
+    }
+    if p.amount <= 0.0 {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "Payment amount must be positive"));
+    }
+    let (reference_no, bank_name, sender_name, receiver_name, mode_label) =
+        normalize_payment_fields(
+            &p.method,
+            &p.reference_no,
+            &p.bank_name,
+            &p.sender_name,
+            &p.receiver_name,
+            &p.mode_label,
+        )?;
+
+    let row = sqlx::query(
+        "UPDATE public.payments
+            SET amount = $1, method = $2, paid_at = $3, reference_no = $4, bank_name = $5,
+                sender_name = $6, receiver_name = $7, mode_label = $8
+          WHERE id = $9
+      RETURNING id, contract_id, amount, method, months_covered, paid_at,
+                reference_no, bank_name, sender_name, receiver_name, mode_label",
+    )
+    .bind(p.amount)
+    .bind(&p.method)
+    .bind(p.paid_at)
+    .bind(&reference_no)
+    .bind(&bank_name)
+    .bind(&sender_name)
+    .bind(&receiver_name)
+    .bind(&mode_label)
+    .bind(id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to update payment")
+    })?
+    .ok_or((StatusCode::NOT_FOUND, "Payment not found"))?;
+
+    let contract_id: Uuid = row.try_get("contract_id").unwrap_or_default();
+
+    let contract_row = sqlx::query(
+        "SELECT lot_id, buyer_name, payment_plan, contract_price, due_day, initial_payment,
+                approval_at, amort_start_date, monthly_amortization, first_installment_amount,
+                term_years, term_months, next_due_date, updated_at
+           FROM public.contracts WHERE id = $1",
+    )
+    .bind(contract_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+    })?;
+
+    if let Some(contract_row) = contract_row {
+        let lot_id: Option<Uuid> = contract_row.try_get("lot_id").ok().flatten();
+        let buyer_name: String = contract_row.try_get("buyer_name").unwrap_or_default();
+        let payment_plan: String = contract_row.try_get("payment_plan").unwrap_or_default();
+        let contract_price: f64 = contract_row.try_get("contract_price").unwrap_or(0.0);
+        let due_day: i32 = contract_row.try_get("due_day").unwrap_or(15);
+        let initial_payment: f64 = contract_row.try_get("initial_payment").unwrap_or(0.0);
+        let approval_at: Option<NaiveDate> = contract_row.try_get("approval_at").ok().flatten();
+        let amort_start_date: Option<NaiveDate> =
+            contract_row.try_get("amort_start_date").ok().flatten();
+        let monthly_amortization: f64 = contract_row.try_get("monthly_amortization").unwrap_or(0.0);
+        let first_installment_amount: Option<f64> =
+            contract_row.try_get("first_installment_amount").ok().flatten();
+        let term_years: i32 = contract_row.try_get("term_years").unwrap_or(0);
+        let term_months: i32 = contract_row.try_get("term_months").unwrap_or(0);
+        let current_due_date: NaiveDate = contract_row
+            .try_get("next_due_date")
+            .unwrap_or_else(|_| Utc::now().date_naive());
+        let updated_at_ts: i64 = contract_row.try_get("updated_at").unwrap_or(0);
+
+        let anchor = amort_start_date.or(approval_at).unwrap_or_else(|| {
+            DateTime::from_timestamp(updated_at_ts, 0)
+                .map(|dt| dt.date_naive())
+                .unwrap_or_else(|| Utc::now().date_naive())
+        });
+        let total_months = if term_months > 0 {
+            term_months
+        } else if term_years > 0 {
+            term_years * 12
+        } else {
+            1
+        };
+
+        let payment_rows = sqlx::query(
+            "SELECT amount, paid_at, months_covered FROM public.payments WHERE contract_id = $1",
+        )
+        .bind(contract_id)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+        })?;
+
+        let payments_for_schedule: Vec<(f64, NaiveDate, i32)> = payment_rows
+            .iter()
+            .map(|r| {
+                (
+                    r.try_get::<f64, _>("amount").unwrap_or(0.0),
+                    r.try_get::<NaiveDate, _>("paid_at").unwrap_or(anchor),
+                    r.try_get::<i32, _>("months_covered").unwrap_or(1),
+                )
+            })
+            .collect();
+
+        let next_due_date = compute_next_unpaid_due_date(
+            anchor,
+            due_day,
+            initial_payment,
+            approval_at,
+            monthly_amortization,
+            first_installment_amount,
+            total_months,
+            &payments_for_schedule,
+        )
+        .unwrap_or(current_due_date);
+
+        let total_paid: f64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(amount), 0) FROM public.payments WHERE contract_id = $1",
+        )
+        .bind(contract_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0.0);
+
+        sqlx::query("UPDATE public.contracts SET next_due_date = $1, updated_at = $2 WHERE id = $3")
+            .bind(next_due_date)
+            .bind(Utc::now().timestamp())
+            .bind(contract_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to update contract")
+            })?;
+
+        if let Some(lot_id) = lot_id {
+            sync_lot_for_contract(
+                &pool,
+                lot_id,
+                &buyer_name,
+                &payment_plan,
+                total_paid >= contract_price && contract_price > 0.0,
+            )
+            .await?;
+        }
+    }
+
+    Ok(Json(row_to_payment(row)))
 }
 
 pub async fn delete_contract(

@@ -227,6 +227,8 @@ Allowed: `cash` | `gcash` | `maya` | `bank` | `others`
 | `20260724_payments_cashflow.sql` | Payment meta; method enum without `card` |
 | `20260724_commission_period_status.sql` | New period status table |
 | `20260724_commission_row_meta.sql` | New row meta table |
+| `20260728_contract_penalty_waiver.sql` | `penalty_waived_through_due_date` |
+| `20260730_contract_first_installment_amount.sql` | `first_installment_amount` (custom month-1 override) |
 
 Optional Node runners under `scripts/` for selected migrations and roster checks (`run-*-migration.mjs`, `check-role-sync.mjs`, `inspect-roster.mjs`, seed helpers). Prefer applying the SQL files directly in production.
 

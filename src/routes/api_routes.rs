@@ -235,6 +235,10 @@ pub fn routes() -> Router {
             post(contracts::record_payment),
         )
         .route(
+            "/payments/{id}",
+            patch(contracts::update_payment),
+        )
+        .route(
             "/contracts/{id}/penalty-waiver",
             patch(contracts::update_penalty_waiver),
         )
