@@ -17,12 +17,15 @@ pub struct UplineRoleTypeResponse {
     pub base_commission_percent: f64,
     pub portal_path: String,
     pub sort_order: i32,
+    /// Whether this role earns its base % on every sale project-wide (a "baseline"
+    /// cut, even outside their own team) or only from their own tree's sales.
+    pub has_baseline: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
 const ROLE_TYPE_COLUMNS: &str =
-    "slug, label, base_commission_percent, portal_path, sort_order, created_at, updated_at";
+    "slug, label, base_commission_percent, portal_path, sort_order, has_baseline, created_at, updated_at";
 
 const RESERVED_PORTAL_PATHS: [&str; 9] = [
     "admin",
@@ -43,6 +46,7 @@ fn row_to_role_type(row: sqlx::postgres::PgRow) -> UplineRoleTypeResponse {
         base_commission_percent: row.try_get("base_commission_percent").unwrap_or(0.0),
         portal_path: row.try_get("portal_path").unwrap_or_default(),
         sort_order: row.try_get("sort_order").unwrap_or(0),
+        has_baseline: row.try_get("has_baseline").unwrap_or(true),
         created_at: row.try_get("created_at").unwrap_or(0),
         updated_at: row.try_get("updated_at").unwrap_or(0),
     }
@@ -124,6 +128,7 @@ pub struct CreateUplineRoleTypeInput {
     pub label: String,
     pub base_commission_percent: f64,
     pub portal_path: String,
+    pub has_baseline: bool,
 }
 
 /// POST /upline-role-types — admin only.
@@ -185,14 +190,15 @@ pub async fn create_upline_role_type(
 
     sqlx::query(
         "INSERT INTO public.upline_role_types
-             (slug, label, base_commission_percent, portal_path, sort_order, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $6)",
+             (slug, label, base_commission_percent, portal_path, sort_order, has_baseline, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
     )
     .bind(&slug)
     .bind(&label)
     .bind(p.base_commission_percent)
     .bind(&portal_path)
     .bind(next_sort)
+    .bind(p.has_baseline)
     .bind(now)
     .execute(&mut *tx)
     .await
@@ -240,6 +246,7 @@ pub struct UpdateUplineRoleTypeInput {
     pub base_commission_percent: f64,
     pub portal_path: String,
     pub sort_order: i32,
+    pub has_baseline: bool,
 }
 
 /// PATCH /upline-role-types/{slug} — admin only. Label/slug are immutable after
@@ -280,13 +287,15 @@ pub async fn update_upline_role_type(
 
     let label: String = sqlx::query_scalar(
         "UPDATE public.upline_role_types
-            SET base_commission_percent = $1, portal_path = $2, sort_order = $3, updated_at = $4
-          WHERE slug = $5
+            SET base_commission_percent = $1, portal_path = $2, sort_order = $3,
+                has_baseline = $4, updated_at = $5
+          WHERE slug = $6
       RETURNING label",
     )
     .bind(p.base_commission_percent)
     .bind(&portal_path)
     .bind(p.sort_order)
+    .bind(p.has_baseline)
     .bind(now)
     .bind(&slug)
     .fetch_optional(&mut *tx)

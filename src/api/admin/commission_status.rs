@@ -18,6 +18,7 @@ pub struct CommissionPeriodStatusResponse {
     pub id: Uuid,
     pub project_id: Uuid,
     pub subject_agent_id: String,
+    pub row_key: String,
     pub period_start: String,
     pub period_end: String,
     pub status: String,
@@ -35,6 +36,7 @@ pub struct ListCommissionStatusQuery {
 #[derive(Deserialize)]
 pub struct UpsertCommissionStatusInput {
     pub subject_agent_id: String,
+    pub row_key: String,
     pub period_start: String,
     pub period_end: String,
     pub status: String,
@@ -70,6 +72,7 @@ pub(crate) fn row_to_status(row: sqlx::postgres::PgRow) -> CommissionPeriodStatu
         id: row.try_get("id").unwrap_or_default(),
         project_id: row.try_get("project_id").unwrap_or_default(),
         subject_agent_id: row.try_get("subject_agent_id").unwrap_or_default(),
+        row_key: row.try_get("row_key").unwrap_or_default(),
         period_start: format_date(period_start),
         period_end: format_date(period_end),
         status: row.try_get("status").unwrap_or_else(|_| "not_yet".into()),
@@ -117,7 +120,7 @@ pub async fn list_commission_status(
         .transpose()?;
 
     let rows = sqlx::query(
-        "SELECT id, project_id, subject_agent_id, period_start, period_end,
+        "SELECT id, project_id, subject_agent_id, row_key, period_start, period_end,
                 status, partial_amount, partial_paid_at, updated_at
            FROM public.commission_period_status
           WHERE project_id = $1
@@ -156,6 +159,10 @@ pub async fn upsert_commission_status(
             StatusCode::UNPROCESSABLE_ENTITY,
             "subject_agent_id is required",
         ));
+    }
+    let row_key = p.row_key.trim();
+    if row_key.is_empty() {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "row_key is required"));
     }
     if !STATUSES.contains(&p.status.as_str()) {
         return Err((
@@ -199,20 +206,21 @@ pub async fn upsert_commission_status(
 
     let row = sqlx::query(
         "INSERT INTO public.commission_period_status (
-            project_id, subject_agent_id, period_start, period_end,
+            project_id, subject_agent_id, row_key, period_start, period_end,
             status, partial_amount, partial_paid_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (project_id, subject_agent_id, period_start) DO UPDATE
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (project_id, subject_agent_id, row_key, period_start) DO UPDATE
             SET period_end = EXCLUDED.period_end,
                 status = EXCLUDED.status,
                 partial_amount = EXCLUDED.partial_amount,
                 partial_paid_at = EXCLUDED.partial_paid_at,
                 updated_at = EXCLUDED.updated_at
-      RETURNING id, project_id, subject_agent_id, period_start, period_end,
+      RETURNING id, project_id, subject_agent_id, row_key, period_start, period_end,
                 status, partial_amount, partial_paid_at, updated_at",
     )
     .bind(project_id)
     .bind(subject)
+    .bind(row_key)
     .bind(period_start)
     .bind(period_end)
     .bind(&p.status)

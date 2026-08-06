@@ -1,0 +1,209 @@
+use axum::{
+    Extension, Json,
+    extract::Path,
+    http::{HeaderMap, StatusCode},
+};
+use chrono::{NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
+use uuid::Uuid;
+
+use crate::api::shared::require_admin;
+use crate::api::users::shared::E;
+
+#[derive(Serialize)]
+pub struct CommissionReleaseEntryResponse {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub subject_agent_id: String,
+    pub period_start: String,
+    pub period_end: String,
+    pub amount: f64,
+    pub paid_at: String,
+    pub created_at: i64,
+    /// Scopes this entry to a specific commission component ("base"/"pool" for a
+    /// root's Baseline vs Direct buyer sections) so they can be released
+    /// independently. Null for plain-agent release entries, which have no split.
+    pub share_kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateCommissionReleaseEntryInput {
+    pub subject_agent_id: String,
+    pub period_start: String,
+    pub period_end: String,
+    pub amount: f64,
+    pub paid_at: String,
+    #[serde(default)]
+    pub share_kind: Option<String>,
+}
+
+fn parse_date(value: &str, field: &'static str) -> Result<NaiveDate, E> {
+    NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            match field {
+                "period_start" => "period_start must be YYYY-MM-DD",
+                "period_end" => "period_end must be YYYY-MM-DD",
+                "paid_at" => "paid_at must be YYYY-MM-DD",
+                _ => "Date must be YYYY-MM-DD",
+            },
+        )
+    })
+}
+
+fn format_date(d: NaiveDate) -> String {
+    d.format("%Y-%m-%d").to_string()
+}
+
+fn row_to_entry(row: sqlx::postgres::PgRow) -> CommissionReleaseEntryResponse {
+    let period_start: NaiveDate = row.try_get("period_start").unwrap_or_default();
+    let period_end: NaiveDate = row.try_get("period_end").unwrap_or_default();
+    let paid_at: NaiveDate = row.try_get("paid_at").unwrap_or_default();
+    CommissionReleaseEntryResponse {
+        id: row.try_get("id").unwrap_or_default(),
+        project_id: row.try_get("project_id").unwrap_or_default(),
+        subject_agent_id: row.try_get("subject_agent_id").unwrap_or_default(),
+        period_start: format_date(period_start),
+        period_end: format_date(period_end),
+        amount: row.try_get("amount").unwrap_or(0.0),
+        paid_at: format_date(paid_at),
+        created_at: row.try_get("created_at").unwrap_or(0),
+        share_kind: row.try_get("share_kind").unwrap_or_default(),
+    }
+}
+
+async fn ensure_project(pool: &PgPool, project_id: Uuid) -> Result<(), E> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM public.projects WHERE id = $1 AND company_id = 1)",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to verify project")
+    })?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "Project not found"));
+    }
+    Ok(())
+}
+
+/// Every dated commission release amount an admin has recorded against a subject +
+/// biweekly period — the ledger can hold multiple entries per period (e.g. a partial
+/// release now, another later), which the frontend sums to compute Remaining.
+pub async fn list_commission_release_entries(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<Vec<CommissionReleaseEntryResponse>>, E> {
+    require_admin(&pool, &headers).await?;
+    ensure_project(&pool, project_id).await?;
+
+    let rows = sqlx::query(
+        "SELECT id, project_id, subject_agent_id, period_start, period_end,
+                amount, paid_at, created_at, share_kind
+           FROM public.commission_release_entries
+          WHERE project_id = $1
+       ORDER BY period_start ASC, subject_agent_id ASC, paid_at ASC",
+    )
+    .bind(project_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load commission release entries",
+        )
+    })?;
+
+    Ok(Json(rows.into_iter().map(row_to_entry).collect()))
+}
+
+pub async fn create_commission_release_entry(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+    Path(project_id): Path<Uuid>,
+    Json(p): Json<CreateCommissionReleaseEntryInput>,
+) -> Result<Json<CommissionReleaseEntryResponse>, E> {
+    require_admin(&pool, &headers).await?;
+    ensure_project(&pool, project_id).await?;
+
+    let subject = p.subject_agent_id.trim();
+    if subject.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subject_agent_id is required",
+        ));
+    }
+    if !p.amount.is_finite() || p.amount <= 0.0 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "amount must be a positive number",
+        ));
+    }
+
+    let period_start = parse_date(&p.period_start, "period_start")?;
+    let period_end = parse_date(&p.period_end, "period_end")?;
+    if period_end < period_start {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "period_end must be on or after period_start",
+        ));
+    }
+    let paid_at = parse_date(&p.paid_at, "paid_at")?;
+
+    let now = Utc::now().timestamp();
+
+    let row = sqlx::query(
+        "INSERT INTO public.commission_release_entries (
+            project_id, subject_agent_id, period_start, period_end,
+            amount, paid_at, created_at, share_kind
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING id, project_id, subject_agent_id, period_start, period_end,
+                amount, paid_at, created_at, share_kind",
+    )
+    .bind(project_id)
+    .bind(subject)
+    .bind(period_start)
+    .bind(period_end)
+    .bind(p.amount)
+    .bind(paid_at)
+    .bind(now)
+    .bind(&p.share_kind)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to save commission release entry",
+        )
+    })?;
+
+    Ok(Json(row_to_entry(row)))
+}
+
+pub async fn delete_commission_release_entry(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+    Path(entry_id): Path<Uuid>,
+) -> Result<StatusCode, E> {
+    require_admin(&pool, &headers).await?;
+
+    sqlx::query("DELETE FROM public.commission_release_entries WHERE id = $1")
+        .bind(entry_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to delete commission release entry",
+            )
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
