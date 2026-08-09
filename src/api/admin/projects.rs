@@ -127,6 +127,109 @@ pub async fn list_projects(
     Ok(Json(rows.into_iter().map(row_to_project).collect()))
 }
 
+#[derive(Serialize)]
+pub struct ProjectSummaryTotals {
+    pub project_id: Uuid,
+    pub buyers: i64,
+    pub tcp: f64,
+    pub collected: f64,
+    pub balance: f64,
+}
+
+#[derive(Serialize)]
+pub struct MonthlyCollectionPoint {
+    pub month: String,
+    pub amount: f64,
+}
+
+#[derive(Serialize)]
+pub struct CompanyProjectsSummary {
+    pub projects: Vec<ProjectSummaryTotals>,
+    pub monthly_collections: Vec<MonthlyCollectionPoint>,
+}
+
+fn row_to_project_summary_totals(row: sqlx::postgres::PgRow) -> ProjectSummaryTotals {
+    ProjectSummaryTotals {
+        project_id: row.try_get("project_id").unwrap_or_default(),
+        buyers: row.try_get("buyers").unwrap_or(0),
+        tcp: row.try_get("tcp").unwrap_or(0.0),
+        collected: row.try_get("collected").unwrap_or(0.0),
+        balance: row.try_get("balance").unwrap_or(0.0),
+    }
+}
+
+fn row_to_monthly_collection_point(row: sqlx::postgres::PgRow) -> MonthlyCollectionPoint {
+    MonthlyCollectionPoint {
+        month: row.try_get("month").unwrap_or_default(),
+        amount: row.try_get("amount").unwrap_or(0.0),
+    }
+}
+
+/// Per-project totals + a company-wide monthly collections trend, computed in SQL —
+/// replaces what used to be a full contracts+payments fetch per project just to
+/// render summary cards on the Projects overview page.
+pub async fn list_projects_summary(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+) -> Result<Json<CompanyProjectsSummary>, E> {
+    require_admin(&pool, &headers).await?;
+
+    let totals_rows = sqlx::query(
+        "SELECT c.project_id,
+                COUNT(DISTINCT COALESCE(c.buyer_user_id::text, 'contract:' || c.id::text)) AS buyers,
+                COALESCE(SUM(c.contract_price), 0) AS tcp,
+                COALESCE(SUM(paid.total_paid), 0) AS collected,
+                COALESCE(SUM(GREATEST(c.contract_price - COALESCE(paid.total_paid, 0), 0)), 0) AS balance
+           FROM public.contracts c
+           JOIN public.projects p ON p.id = c.project_id AND p.company_id = 1
+           LEFT JOIN (
+               SELECT contract_id, SUM(amount) AS total_paid
+                 FROM public.payments
+             GROUP BY contract_id
+           ) paid ON paid.contract_id = c.id
+       GROUP BY c.project_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load project totals",
+        )
+    })?;
+
+    let monthly_rows = sqlx::query(
+        "SELECT to_char(p.paid_at, 'YYYY-MM') AS month, COALESCE(SUM(p.amount), 0) AS amount
+           FROM public.payments p
+           JOIN public.contracts c ON c.id = p.contract_id
+           JOIN public.projects pr ON pr.id = c.project_id AND pr.company_id = 1
+          WHERE p.paid_at >= (((now() AT TIME ZONE 'UTC')::date) - INTERVAL '12 months')
+       GROUP BY month
+       ORDER BY month",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load monthly collections",
+        )
+    })?;
+
+    Ok(Json(CompanyProjectsSummary {
+        projects: totals_rows
+            .into_iter()
+            .map(row_to_project_summary_totals)
+            .collect(),
+        monthly_collections: monthly_rows
+            .into_iter()
+            .map(row_to_monthly_collection_point)
+            .collect(),
+    }))
+}
+
 pub async fn create_project(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,

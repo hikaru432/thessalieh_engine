@@ -12,6 +12,7 @@ use subtle::ConstantTimeEq;
 use super::shared::{E, MessageResponse, is_strong_password, is_valid_email};
 use crate::api::mailer;
 use crate::api::verified::Verified;
+use crate::infra::session_cache::SessionCache;
 
 #[derive(Deserialize)]
 struct RequestInput {
@@ -226,30 +227,31 @@ pub async fn confirm(
         .unwrap()
         .to_string();
 
-    let updated = sqlx::query(
+    let updated_id: Option<uuid::Uuid> = sqlx::query_scalar(
         "UPDATE public.users
             SET password_hash         = $1,
                 updated_at            = $2,
                 failed_login_attempts = 0,
                 lockout_until         = 0
-          WHERE email = $3",
+          WHERE email = $3
+      RETURNING id",
     )
     .bind(&hash)
     .bind(now)
     .bind(&p.email)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| {
         tracing::error!("DB: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "Reset failed")
     })?;
 
-    if updated.rows_affected() == 0 {
+    let Some(user_id) = updated_id else {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "No account for this email",
         ));
-    }
+    };
 
     sqlx::query("DELETE FROM public.password_reset_codes WHERE email = $1")
         .bind(&p.email)
@@ -260,19 +262,17 @@ pub async fn confirm(
             (StatusCode::INTERNAL_SERVER_ERROR, "Reset failed")
         })?;
 
-    sqlx::query(
-        "DELETE FROM public.sessions
-          WHERE user_id = (SELECT id FROM public.users WHERE email = $1)",
-    )
-    .bind(&p.email)
-    .execute(&mut *tx)
-    .await
-    .ok();
+    sqlx::query("DELETE FROM public.sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .ok();
 
     tx.commit().await.map_err(|e| {
         tracing::error!("DB: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "Reset failed")
     })?;
+    SessionCache::global().invalidate_user(user_id);
 
     tracing::info!(email = %p.email, "password reset successful");
     Ok((

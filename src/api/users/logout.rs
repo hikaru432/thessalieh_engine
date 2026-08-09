@@ -3,6 +3,7 @@ use axum::http::{HeaderMap, StatusCode, header::SET_COOKIE};
 use sqlx::PgPool;
 
 use super::shared::{clear_csrf_cookie, clear_session_cookie, extract_session_id};
+use crate::infra::session_cache::SessionCache;
 
 pub async fn logout(
     Extension(pool): Extension<PgPool>,
@@ -13,6 +14,7 @@ pub async fn logout(
             .bind(sid)
             .execute(&pool)
             .await;
+        SessionCache::global().invalidate(sid);
     }
     let mut h = HeaderMap::new();
     h.append(SET_COOKIE, clear_session_cookie());

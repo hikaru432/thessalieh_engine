@@ -11,6 +11,7 @@ use super::shared::{
     E, SESSION_MAX_AGE, UserResponse, csrf_cookie, new_csrf_token, session_cookie,
 };
 use crate::api::verified::Verified;
+use crate::infra::session_cache::SessionCache;
 
 // Per-account lockout tuning: 5 bad attempts → 15-minute lockout.
 const MAX_FAILED_ATTEMPTS: i32 = 5;
@@ -127,6 +128,7 @@ pub async fn login(
         .bind(now)
         .execute(&pool)
         .await;
+    SessionCache::global().invalidate_user(user_id);
 
     let session_id = uuid::Uuid::new_v4();
     sqlx::query(

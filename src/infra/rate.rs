@@ -18,6 +18,16 @@ use tokio::time::Instant;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Idle per-key buckets older than this are dropped by `sweep`, which runs
+/// off the periodic gc tick.
+const IDLE_TTL: Duration = Duration::from_secs(300);
+
+/// Hard ceiling on distinct keys (`ip:*` + `device:*`) tracked at once.
+/// Bounds worst-case memory even during a burst that outruns the sweep
+/// interval, the same way `api::verified::NonceStore` caps itself instead
+/// of growing unbounded.
+const MAX_TRACKED_KEYS: usize = 200_000;
+
 #[derive(Clone)]
 pub struct RateLimiter {
     per_key: Arc<DashMap<String, TokenBucket>>,
@@ -75,10 +85,25 @@ impl RateLimiter {
     }
 
     async fn check_bucket(&self, key: String) -> bool {
+        if let Some(mut bucket) = self.per_key.get_mut(&key) {
+            return bucket.try_acquire();
+        }
+
+        if self.per_key.len() >= MAX_TRACKED_KEYS {
+            return false;
+        }
+
         self.per_key
             .entry(key)
             .or_insert_with(|| TokenBucket::new(self.max_requests, self.window))
             .try_acquire()
+    }
+
+    /// Drops per-key buckets that haven't been touched within `IDLE_TTL`.
+    /// Called from the periodic gc sweep.
+    pub fn sweep(&self) {
+        self.per_key
+            .retain(|_, b| b.last_refill.elapsed() < IDLE_TTL);
     }
 
     pub async fn check(&self, device_id: Option<String>, ip: IpAddr) -> bool {

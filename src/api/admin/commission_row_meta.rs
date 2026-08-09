@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::api::pagination::{Page, PageQuery, total_count};
 use crate::api::shared::require_admin;
 use crate::api::users::shared::E;
 
@@ -85,7 +86,8 @@ pub async fn list_commission_row_meta(
     headers: HeaderMap,
     Path(project_id): Path<Uuid>,
     Query(query): Query<ListCommissionRowMetaQuery>,
-) -> Result<Json<Vec<CommissionRowMetaResponse>>, E> {
+    Query(page_query): Query<PageQuery>,
+) -> Result<Json<Page<CommissionRowMetaResponse>>, E> {
     require_admin(&pool, &headers).await?;
     ensure_project(&pool, project_id).await?;
 
@@ -96,14 +98,18 @@ pub async fn list_commission_row_meta(
         .filter(|s| !s.is_empty());
 
     let rows = sqlx::query(
-        "SELECT id, project_id, subject_agent_id, row_key, period_start, other_flag, updated_at
+        "SELECT id, project_id, subject_agent_id, row_key, period_start, other_flag, updated_at,
+                COUNT(*) OVER() AS total_count
            FROM public.commission_row_meta
           WHERE project_id = $1
             AND ($2::text IS NULL OR subject_agent_id = $2)
-       ORDER BY period_start ASC, row_key ASC",
+       ORDER BY period_start ASC, row_key ASC
+          LIMIT $3 OFFSET $4",
     )
     .bind(project_id)
     .bind(subject)
+    .bind(page_query.per_page())
+    .bind(page_query.offset())
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -114,7 +120,12 @@ pub async fn list_commission_row_meta(
         )
     })?;
 
-    Ok(Json(rows.into_iter().map(row_to_meta).collect()))
+    let total = total_count(&rows);
+    Ok(Json(Page::new(
+        rows.into_iter().map(row_to_meta).collect(),
+        &page_query,
+        total,
+    )))
 }
 
 pub async fn upsert_commission_row_meta(

@@ -4,15 +4,23 @@ use chrono::Utc;
 use sqlx::PgPool;
 use tokio::time;
 
+use super::limiter::ConcurrencyLimiter;
+use super::rate::RateLimiter;
+use super::session_cache::SessionCache;
+
 const GC_INTERVAL_SECS: u64 = 60;
 
-pub fn spawn(pool: PgPool) {
+pub fn spawn(pool: PgPool, concurrency_limiter: ConcurrencyLimiter, rate_limiter: RateLimiter) {
     tokio::spawn(async move {
         let mut ticker = time::interval(Duration::from_secs(GC_INTERVAL_SECS));
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             let now = Utc::now().timestamp();
+
+            SessionCache::global().sweep(now);
+            concurrency_limiter.sweep();
+            rate_limiter.sweep();
 
             match sqlx::query("DELETE FROM public.verification_codes WHERE expires_at <= $1")
                 .bind(now)

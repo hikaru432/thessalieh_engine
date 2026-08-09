@@ -1,0 +1,287 @@
+use axum::{
+    Extension, Json,
+    extract::{Path, Query},
+    http::{HeaderMap, StatusCode},
+};
+use chrono::{Datelike, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
+use uuid::Uuid;
+
+use crate::api::pagination::{Page, PageQuery, total_count};
+use crate::api::shared::require_admin;
+use crate::api::users::shared::E;
+
+#[derive(Serialize)]
+pub struct ContractSplitHistoryResponse {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub split_months: i32,
+    /// The 1st or the 16th of a month — the exact biweek release period this split
+    /// takes effect from, matching the release cycle (1-15 releases the 16th; 16-30/31
+    /// releases the 1st of the next month), not a whole-calendar-month granularity.
+    pub effective_period_start: String,
+    pub created_at: i64,
+}
+
+fn row_to_entry(row: sqlx::postgres::PgRow) -> ContractSplitHistoryResponse {
+    let effective_period_start: NaiveDate = row.try_get("effective_period_start").unwrap_or_default();
+    ContractSplitHistoryResponse {
+        id: row.try_get("id").unwrap_or_default(),
+        contract_id: row.try_get("contract_id").unwrap_or_default(),
+        split_months: row.try_get("split_months").unwrap_or_default(),
+        effective_period_start: effective_period_start.format("%Y-%m-%d").to_string(),
+        created_at: row.try_get("created_at").unwrap_or(0),
+    }
+}
+
+async fn ensure_project(pool: &PgPool, project_id: Uuid) -> Result<(), E> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM public.projects WHERE id = $1 AND company_id = 1)",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to verify project")
+    })?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "Project not found"));
+    }
+    Ok(())
+}
+
+/// Every split-history row for every contract in the project, in one call — mirrors
+/// how contracts/payments/status are already bulk-fetched per project.
+pub async fn list_contract_split_history(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+    Path(project_id): Path<Uuid>,
+    Query(page_query): Query<PageQuery>,
+) -> Result<Json<Page<ContractSplitHistoryResponse>>, E> {
+    require_admin(&pool, &headers).await?;
+    ensure_project(&pool, project_id).await?;
+
+    let rows = sqlx::query(
+        "SELECT h.id, h.contract_id, h.split_months, h.effective_period_start, h.created_at,
+                COUNT(*) OVER() AS total_count
+           FROM public.contract_split_history h
+           JOIN public.contracts c ON c.id = h.contract_id
+          WHERE c.project_id = $1
+       ORDER BY h.contract_id ASC, h.effective_period_start ASC
+          LIMIT $2 OFFSET $3",
+    )
+    .bind(project_id)
+    .bind(page_query.per_page())
+    .bind(page_query.offset())
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load contract split history",
+        )
+    })?;
+
+    let total = total_count(&rows);
+    Ok(Json(Page::new(
+        rows.into_iter().map(row_to_entry).collect(),
+        &page_query,
+        total,
+    )))
+}
+
+#[derive(Deserialize)]
+pub struct ChangeContractSplitInput {
+    pub split_months: i32,
+}
+
+#[derive(Serialize)]
+pub struct ChangeContractSplitResponse {
+    pub contract_id: Uuid,
+    pub split_months: i32,
+    pub history: Vec<ContractSplitHistoryResponse>,
+}
+
+/// The exact biweek release period a split change takes effect from, matching this
+/// system's real release cadence — a calendar month has two releases: the 1-15 period
+/// releases on the 16th, and the 16-30/31 period releases on the 1st of the NEXT
+/// month. Saving on or before the 15th takes effect from the current 1-15 period (its
+/// own release, the 16th, hasn't happened yet); saving on the 16th or later takes
+/// effect from the current 16-30/31 period (its own release, the 1st of next month,
+/// hasn't happened yet either) — NOT deferred to periods dated the following calendar
+/// month. Either way the effective period is always within the SAME calendar month as
+/// the edit, since neither of that month's two releases can have already happened by
+/// the time this fires (the edit's own "today" is always before both).
+fn effective_period_start_for_now() -> NaiveDate {
+    let now = Utc::now().date_naive();
+    let day = if now.day() <= 15 { 1 } else { 16 };
+    NaiveDate::from_ymd_opt(now.year(), now.month(), day).unwrap_or(now)
+}
+
+/// Same day<=15-or-16 rule as `effective_period_start_for_now`, applied to an
+/// arbitrary anchor date (used for the lazily-backfilled genesis row).
+fn period_start_containing(date: NaiveDate) -> NaiveDate {
+    let day = if date.day() <= 15 { 1 } else { 16 };
+    NaiveDate::from_ymd_opt(date.year(), date.month(), day).unwrap_or(date)
+}
+
+/// Records a split-months change for an existing contract, effective going forward
+/// only — past months keep whatever they already displayed under the old split. The
+/// first time this is called for a contract, it also lazily backfills a genesis row
+/// (the contract's original split value, effective at its approval month) so history
+/// is always complete once any change happens, with no migration needed to backfill
+/// every existing contract.
+pub async fn change_contract_split(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+    Path(contract_id): Path<Uuid>,
+    Json(p): Json<ChangeContractSplitInput>,
+) -> Result<Json<ChangeContractSplitResponse>, E> {
+    require_admin(&pool, &headers).await?;
+
+    if !(1..=120).contains(&p.split_months) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Split months must be between 1 and 120",
+        ));
+    }
+
+    let contract = sqlx::query(
+        "SELECT agent_commission_split_months, approval_at, updated_at
+           FROM public.contracts WHERE id = $1",
+    )
+    .bind(contract_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load contract")
+    })?
+    .ok_or((StatusCode::NOT_FOUND, "Contract not found"))?;
+
+    let current_split_months: i32 = contract
+        .try_get("agent_commission_split_months")
+        .unwrap_or(36);
+    if current_split_months == p.split_months {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "New split months must differ from the current value",
+        ));
+    }
+
+    let approval_at: Option<NaiveDate> = contract.try_get("approval_at").ok().flatten();
+    let updated_at: i64 = contract.try_get("updated_at").unwrap_or(0);
+    let genesis_anchor = approval_at.unwrap_or_else(|| {
+        chrono::DateTime::from_timestamp(updated_at, 0)
+            .map(|dt| dt.date_naive())
+            .unwrap_or_else(|| Utc::now().date_naive())
+    });
+    let genesis_period_start = period_start_containing(genesis_anchor);
+
+    let effective_period_start = effective_period_start_for_now();
+    let now = Utc::now().timestamp();
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start transaction")
+    })?;
+
+    let has_history: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM public.contract_split_history WHERE contract_id = $1)",
+    )
+    .bind(contract_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to check split history")
+    })?;
+
+    if !has_history {
+        sqlx::query(
+            "INSERT INTO public.contract_split_history
+                (contract_id, split_months, effective_period_start, created_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (contract_id, effective_period_start) DO NOTHING",
+        )
+        .bind(contract_id)
+        .bind(current_split_months)
+        .bind(genesis_period_start)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to record original split",
+            )
+        })?;
+    }
+
+    sqlx::query(
+        "INSERT INTO public.contract_split_history
+            (contract_id, split_months, effective_period_start, created_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (contract_id, effective_period_start) DO UPDATE
+            SET split_months = EXCLUDED.split_months,
+                created_at = EXCLUDED.created_at",
+    )
+    .bind(contract_id)
+    .bind(p.split_months)
+    .bind(effective_period_start)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to record split change",
+        )
+    })?;
+
+    sqlx::query(
+        "UPDATE public.contracts SET agent_commission_split_months = $1, updated_at = $2 WHERE id = $3",
+    )
+    .bind(p.split_months)
+    .bind(now)
+    .bind(contract_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to update contract")
+    })?;
+
+    let history_rows = sqlx::query(
+        "SELECT id, contract_id, split_months, effective_period_start, created_at
+           FROM public.contract_split_history
+          WHERE contract_id = $1
+       ORDER BY effective_period_start ASC",
+    )
+    .bind(contract_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to reload split history",
+        )
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to commit split change")
+    })?;
+
+    Ok(Json(ChangeContractSplitResponse {
+        contract_id,
+        split_months: p.split_months,
+        history: history_rows.into_iter().map(row_to_entry).collect(),
+    }))
+}

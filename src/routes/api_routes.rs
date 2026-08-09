@@ -11,7 +11,8 @@ use sqlx::PgPool;
 
 use crate::api::admin::{
     commission_rates, commission_release_entries, commission_row_meta, commission_split_schedule,
-    commission_status, company, contracts, lots, projects, roster, upline_role_types,
+    commission_status, company, contract_split_history, contracts, installment_status_overrides,
+    lots, projects, roster, upline_role_types,
 };
 use crate::api::buyer;
 use crate::api::leadbroker;
@@ -194,9 +195,18 @@ pub fn routes() -> Router {
             "/projects",
             get(projects::list_projects).post(projects::create_project),
         )
+        .route("/projects/summary", get(projects::list_projects_summary))
         .route(
             "/projects/{project_id}/agents",
             patch(projects::update_project_agents),
+        )
+        .route(
+            "/projects/{project_id}/dashboard-summary",
+            get(contracts::project_dashboard_summary),
+        )
+        .route(
+            "/projects/{project_id}/buyers/{buyer_user_id}/detail",
+            get(contracts::buyer_detail),
         )
         .route(
             "/projects/{project_id}/commission-status",
@@ -216,6 +226,23 @@ pub fn routes() -> Router {
         .route(
             "/commission-release-entries/{entry_id}",
             axum::routing::delete(commission_release_entries::delete_commission_release_entry),
+        )
+        .route(
+            "/projects/{project_id}/installment-status",
+            get(installment_status_overrides::list_installment_status_overrides)
+                .put(installment_status_overrides::upsert_installment_status_override),
+        )
+        .route(
+            "/installment-status/{id}",
+            axum::routing::delete(installment_status_overrides::delete_installment_status_override),
+        )
+        .route(
+            "/projects/{project_id}/contract-split-history",
+            get(contract_split_history::list_contract_split_history),
+        )
+        .route(
+            "/contracts/{id}/split-change",
+            patch(contract_split_history::change_contract_split),
         )
         .route(
             "/projects/{project_id}/lots",

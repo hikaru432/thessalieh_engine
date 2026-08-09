@@ -1,6 +1,6 @@
 use axum::{
     Extension, Json,
-    extract::Path,
+    extract::{Path, Query},
     http::{HeaderMap, StatusCode},
 };
 use chrono::Utc;
@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::api::pagination::{Page, PageQuery, total_count};
 use crate::api::shared::require_admin;
 use crate::api::users::shared::E;
+use crate::infra::session_cache::SessionCache;
 
 const STATUSES: [&str; 2] = ["Active", "Inactive"];
 
@@ -292,15 +294,19 @@ async fn fetch_roster_entry(pool: &PgPool, id: Uuid) -> Result<Json<RosterRespon
 pub async fn list_roster(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,
-) -> Result<Json<Vec<RosterResponse>>, E> {
+    Query(page_query): Query<PageQuery>,
+) -> Result<Json<Page<RosterResponse>>, E> {
     require_admin(&pool, &headers).await?;
 
     let rows = sqlx::query(&format!(
-        "SELECT {ROSTER_COLUMNS} FROM public.roster r
+        "SELECT {ROSTER_COLUMNS}, COUNT(*) OVER() AS total_count FROM public.roster r
          JOIN public.users u ON u.id = r.user_id
         WHERE r.company_id = 1
-     ORDER BY r.role ASC, u.username ASC",
+     ORDER BY r.role ASC, u.username ASC
+        LIMIT $1 OFFSET $2",
     ))
+    .bind(page_query.per_page())
+    .bind(page_query.offset())
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -308,7 +314,12 @@ pub async fn list_roster(
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load roster")
     })?;
 
-    Ok(Json(rows.into_iter().map(row_to_roster).collect()))
+    let total = total_count(&rows);
+    Ok(Json(Page::new(
+        rows.into_iter().map(row_to_roster).collect(),
+        &page_query,
+        total,
+    )))
 }
 
 pub async fn create_roster_entry(
@@ -370,6 +381,7 @@ pub async fn create_roster_entry(
             "Failed to save roster entry",
         )
     })?;
+    SessionCache::global().invalidate_user(p.user_id);
 
     fetch_roster_entry(&pool, id).await
 }
@@ -456,6 +468,10 @@ pub async fn update_roster_entry(
             "Failed to save roster entry",
         )
     })?;
+    if old_user_id != p.user_id {
+        SessionCache::global().invalidate_user(old_user_id);
+    }
+    SessionCache::global().invalidate_user(p.user_id);
 
     fetch_roster_entry(&pool, id).await
 }
@@ -517,6 +533,7 @@ pub async fn delete_roster_entry(
             "Failed to delete roster entry",
         )
     })?;
+    SessionCache::global().invalidate_user(user_id);
 
     Ok(StatusCode::NO_CONTENT)
 }

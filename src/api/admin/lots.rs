@@ -1,6 +1,6 @@
 use axum::{
     Extension, Json,
-    extract::Path,
+    extract::{Path, Query},
     http::{HeaderMap, StatusCode},
 };
 use chrono::{DateTime, Utc};
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::api::pagination::{Page, PageQuery, total_count};
 use crate::api::shared::require_admin;
 use crate::api::users::shared::E;
 
@@ -195,15 +196,19 @@ pub async fn list_lots(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,
     Path(project_id): Path<Uuid>,
-) -> Result<Json<Vec<LotResponse>>, E> {
+    Query(page_query): Query<PageQuery>,
+) -> Result<Json<Page<LotResponse>>, E> {
     require_admin(&pool, &headers).await?;
 
     let rows = sqlx::query(&format!(
-        "SELECT {LOT_COLUMNS} FROM public.lots
+        "SELECT {LOT_COLUMNS}, COUNT(*) OVER() AS total_count FROM public.lots
           WHERE project_id = $1
-       ORDER BY block ASC, lot ASC",
+       ORDER BY block ASC, lot ASC
+          LIMIT $2 OFFSET $3",
     ))
     .bind(project_id)
+    .bind(page_query.per_page())
+    .bind(page_query.offset())
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -211,7 +216,12 @@ pub async fn list_lots(
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load lots")
     })?;
 
-    Ok(Json(rows.into_iter().map(row_to_lot).collect()))
+    let total = total_count(&rows);
+    Ok(Json(Page::new(
+        rows.into_iter().map(row_to_lot).collect(),
+        &page_query,
+        total,
+    )))
 }
 
 pub async fn create_lot(

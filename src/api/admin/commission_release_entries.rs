@@ -1,6 +1,6 @@
 use axum::{
     Extension, Json,
-    extract::Path,
+    extract::{Path, Query},
     http::{HeaderMap, StatusCode},
 };
 use chrono::{NaiveDate, Utc};
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::api::pagination::{Page, PageQuery, total_count};
 use crate::api::shared::require_admin;
 use crate::api::users::shared::E;
 
@@ -97,18 +98,22 @@ pub async fn list_commission_release_entries(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,
     Path(project_id): Path<Uuid>,
-) -> Result<Json<Vec<CommissionReleaseEntryResponse>>, E> {
+    Query(page_query): Query<PageQuery>,
+) -> Result<Json<Page<CommissionReleaseEntryResponse>>, E> {
     require_admin(&pool, &headers).await?;
     ensure_project(&pool, project_id).await?;
 
     let rows = sqlx::query(
         "SELECT id, project_id, subject_agent_id, period_start, period_end,
-                amount, paid_at, created_at, share_kind
+                amount, paid_at, created_at, share_kind, COUNT(*) OVER() AS total_count
            FROM public.commission_release_entries
           WHERE project_id = $1
-       ORDER BY period_start ASC, subject_agent_id ASC, paid_at ASC",
+       ORDER BY period_start ASC, subject_agent_id ASC, paid_at ASC
+          LIMIT $2 OFFSET $3",
     )
     .bind(project_id)
+    .bind(page_query.per_page())
+    .bind(page_query.offset())
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -119,7 +124,12 @@ pub async fn list_commission_release_entries(
         )
     })?;
 
-    Ok(Json(rows.into_iter().map(row_to_entry).collect()))
+    let total = total_count(&rows);
+    Ok(Json(Page::new(
+        rows.into_iter().map(row_to_entry).collect(),
+        &page_query,
+        total,
+    )))
 }
 
 pub async fn create_commission_release_entry(

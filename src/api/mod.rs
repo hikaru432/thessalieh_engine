@@ -5,6 +5,7 @@ pub mod leadbroker;
 pub mod titlingofficer;
 pub mod upline_portal;
 pub mod mailer;
+pub mod pagination;
 pub mod shared;
 pub mod users;
 pub mod verified;

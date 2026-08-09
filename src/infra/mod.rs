@@ -3,4 +3,5 @@ pub mod db;
 pub mod gc;
 pub mod limiter;
 pub mod rate;
+pub mod session_cache;
 pub mod storage;

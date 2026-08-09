@@ -75,10 +75,11 @@ async fn main() {
         .allow_credentials(true);
 
     let nonce_store: api::verified::NonceStore = Arc::new(DashMap::new());
+    infra::session_cache::SessionCache::install();
 
     let db_pool = init_db_pool().await;
 
-    infra::gc::spawn(db_pool.clone());
+    infra::gc::spawn(db_pool.clone(), limiter.clone(), rate_limiter.clone());
 
     let supabase_url = env::var("SUPABASE_URL").expect("SUPABASE_URL must be set");
     let supabase_jwt =

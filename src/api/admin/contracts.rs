@@ -1,6 +1,6 @@
 use axum::{
     Extension, Json,
-    extract::Path,
+    extract::{Path, Query},
     http::{HeaderMap, StatusCode},
 };
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::api::pagination::{Page, PageQuery, total_count};
 use crate::api::shared::require_admin;
 use crate::api::users::shared::E;
 
@@ -765,23 +766,185 @@ async fn clear_lot(pool: &PgPool, lot_id: Uuid) -> Result<(), E> {
     Ok(())
 }
 
+#[derive(Serialize)]
+pub struct ProjectContractTotals {
+    pub buyers: i64,
+    pub tcp: f64,
+    pub collected: f64,
+    pub balance: f64,
+}
+
+#[derive(Serialize)]
+pub struct ContractStatusCounts {
+    pub fully_paid: i64,
+    pub needs_attention: i64,
+    pub on_track: i64,
+}
+
+#[derive(Serialize)]
+pub struct ProjectLotStats {
+    pub total_lots: i64,
+    pub available_lots: i64,
+    pub reserved_lots: i64,
+    pub installment_lots: i64,
+    pub fully_paid_lots: i64,
+    pub catalog_value: f64,
+}
+
+#[derive(Serialize)]
+pub struct ProjectDashboardSummary {
+    pub totals: ProjectContractTotals,
+    pub contract_status_counts: ContractStatusCounts,
+    pub lot_stats: ProjectLotStats,
+    pub monthly_collections: Vec<crate::api::admin::projects::MonthlyCollectionPoint>,
+}
+
+/// Contract totals + status counts + lot stats + a 12-month collections trend for one
+/// project, computed in SQL — replaces what used to be a full contracts+lots+payments
+/// fetch just to render the dashboard's summary tiles and chart.
+///
+/// The status CASE here must stay byte-identical to `row_to_contract`'s: balance is
+/// computed per-contract (`GROUP BY c.id` before classifying, so the payments LEFT JOIN
+/// never fans out the row), and "today" uses `(now() AT TIME ZONE 'UTC')::date` to match
+/// Rust's `Utc::now().date_naive()` exactly — the DB session's default TimeZone GUC is
+/// not otherwise guaranteed to be UTC.
+pub async fn project_dashboard_summary(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<ProjectDashboardSummary>, E> {
+    require_admin(&pool, &headers).await?;
+
+    let totals_row = sqlx::query(
+        "WITH contract_totals AS (
+             SELECT c.id, c.buyer_user_id, c.contract_price, c.next_due_date,
+                    COALESCE(SUM(pmt.amount), 0) AS total_paid
+               FROM public.contracts c
+               LEFT JOIN public.payments pmt ON pmt.contract_id = c.id
+              WHERE c.project_id = $1
+           GROUP BY c.id
+         ),
+         classified AS (
+             SELECT *,
+                    GREATEST(contract_price - total_paid, 0) AS balance,
+                    CASE
+                        WHEN GREATEST(contract_price - total_paid, 0) <= 0 THEN 'Fully Paid'
+                        WHEN next_due_date < ((now() AT TIME ZONE 'UTC')::date) THEN 'Needs Attention'
+                        ELSE 'On Track'
+                    END AS status
+               FROM contract_totals
+         )
+         SELECT
+             COUNT(DISTINCT COALESCE(buyer_user_id::text, 'contract:' || id::text)) AS buyers,
+             COALESCE(SUM(contract_price), 0) AS tcp,
+             COALESCE(SUM(total_paid), 0) AS collected,
+             COALESCE(SUM(balance), 0) AS balance,
+             COUNT(*) FILTER (WHERE status = 'Fully Paid') AS fully_paid,
+             COUNT(*) FILTER (WHERE status = 'Needs Attention') AS needs_attention,
+             COUNT(*) FILTER (WHERE status = 'On Track') AS on_track
+           FROM classified",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load contract totals",
+        )
+    })?;
+
+    let lot_row = sqlx::query(
+        "SELECT
+             COUNT(*) AS total_lots,
+             COUNT(*) FILTER (WHERE status = 'Available') AS available_lots,
+             COUNT(*) FILTER (WHERE status = 'Reserved') AS reserved_lots,
+             COUNT(*) FILTER (WHERE status = 'Installment') AS installment_lots,
+             COUNT(*) FILTER (WHERE status = 'Sold') AS fully_paid_lots,
+             COALESCE(SUM(contract_price), 0) AS catalog_value
+           FROM public.lots
+          WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load lot stats")
+    })?;
+
+    let monthly_rows = sqlx::query(
+        "SELECT to_char(p.paid_at, 'YYYY-MM') AS month, COALESCE(SUM(p.amount), 0) AS amount
+           FROM public.payments p
+           JOIN public.contracts c ON c.id = p.contract_id
+          WHERE c.project_id = $1
+            AND p.paid_at >= (((now() AT TIME ZONE 'UTC')::date) - INTERVAL '12 months')
+       GROUP BY month
+       ORDER BY month",
+    )
+    .bind(project_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load monthly collections",
+        )
+    })?;
+
+    Ok(Json(ProjectDashboardSummary {
+        totals: ProjectContractTotals {
+            buyers: totals_row.try_get("buyers").unwrap_or(0),
+            tcp: totals_row.try_get("tcp").unwrap_or(0.0),
+            collected: totals_row.try_get("collected").unwrap_or(0.0),
+            balance: totals_row.try_get("balance").unwrap_or(0.0),
+        },
+        contract_status_counts: ContractStatusCounts {
+            fully_paid: totals_row.try_get("fully_paid").unwrap_or(0),
+            needs_attention: totals_row.try_get("needs_attention").unwrap_or(0),
+            on_track: totals_row.try_get("on_track").unwrap_or(0),
+        },
+        lot_stats: ProjectLotStats {
+            total_lots: lot_row.try_get("total_lots").unwrap_or(0),
+            available_lots: lot_row.try_get("available_lots").unwrap_or(0),
+            reserved_lots: lot_row.try_get("reserved_lots").unwrap_or(0),
+            installment_lots: lot_row.try_get("installment_lots").unwrap_or(0),
+            fully_paid_lots: lot_row.try_get("fully_paid_lots").unwrap_or(0),
+            catalog_value: lot_row.try_get("catalog_value").unwrap_or(0.0),
+        },
+        monthly_collections: monthly_rows
+            .into_iter()
+            .map(|row| crate::api::admin::projects::MonthlyCollectionPoint {
+                month: row.try_get("month").unwrap_or_default(),
+                amount: row.try_get("amount").unwrap_or(0.0),
+            })
+            .collect(),
+    }))
+}
+
 pub async fn list_contracts(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,
     Path(project_id): Path<Uuid>,
-) -> Result<Json<Vec<ContractResponse>>, E> {
+    Query(page_query): Query<PageQuery>,
+) -> Result<Json<Page<ContractResponse>>, E> {
     require_admin(&pool, &headers).await?;
 
     let rows = sqlx::query(&format!(
-        "SELECT {CONTRACT_COLUMNS_WITH_TOTALS}
+        "SELECT {CONTRACT_COLUMNS_WITH_TOTALS}, COUNT(*) OVER() AS total_count
            FROM public.contracts c
            LEFT JOIN public.users bu ON bu.id = c.buyer_user_id
            LEFT JOIN public.payments p ON p.contract_id = c.id
           WHERE c.project_id = $1
        GROUP BY c.id
-       ORDER BY c.created_at ASC",
+       ORDER BY c.created_at ASC
+          LIMIT $2 OFFSET $3",
     ))
     .bind(project_id)
+    .bind(page_query.per_page())
+    .bind(page_query.offset())
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -789,7 +952,12 @@ pub async fn list_contracts(
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load contracts")
     })?;
 
-    Ok(Json(rows.into_iter().map(row_to_contract).collect()))
+    let total = total_count(&rows);
+    Ok(Json(Page::new(
+        rows.into_iter().map(row_to_contract).collect(),
+        &page_query,
+        total,
+    )))
 }
 
 pub async fn get_contract(
@@ -995,7 +1163,7 @@ pub async fn update_contract(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-    Json(p): Json<ContractInput>,
+    Json(mut p): Json<ContractInput>,
 ) -> Result<Json<ContractResponse>, E> {
     require_admin(&pool, &headers).await?;
     validate_contract_input(&p)?;
@@ -1006,16 +1174,24 @@ pub async fn update_contract(
     validate_buyer_user(&pool, buyer_user_id).await?;
     let names = resolve_buyer_names(&p)?;
 
-    let previous_lot_id: Option<Uuid> =
-        sqlx::query_scalar("SELECT lot_id FROM public.contracts WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| {
-                tracing::error!("DB: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
-            })?
-            .ok_or((StatusCode::NOT_FOUND, "Contract not found"))?;
+    let previous_row = sqlx::query("SELECT lot_id, agent_commission_split_months FROM public.contracts WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+        })?
+        .ok_or((StatusCode::NOT_FOUND, "Contract not found"))?;
+    let previous_lot_id: Option<Uuid> = previous_row.try_get("lot_id").ok().flatten();
+    // The general edit form can no longer change the split — it must go through the
+    // dedicated /contracts/{id}/split-change endpoint (contract_split_history.rs) so
+    // a change is recorded with an effective date instead of silently overwriting the
+    // schedule for every past month too. Force it back to the current value here
+    // regardless of what the client sent, as defense in depth.
+    p.agent_commission_split_months = previous_row
+        .try_get("agent_commission_split_months")
+        .unwrap_or(p.agent_commission_split_months);
 
     let now = Utc::now().timestamp();
     let (contract_price, list_price, is_promo) = resolve_contract_prices(&p)?;
@@ -1396,19 +1572,24 @@ pub async fn list_project_payments(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,
     Path(project_id): Path<Uuid>,
-) -> Result<Json<Vec<CashFlowPaymentResponse>>, E> {
+    Query(page_query): Query<PageQuery>,
+) -> Result<Json<Page<CashFlowPaymentResponse>>, E> {
     require_admin(&pool, &headers).await?;
 
     let rows = sqlx::query(
         "SELECT p.id, p.contract_id, p.amount, p.method, p.months_covered, p.paid_at,
                 p.reference_no, p.bank_name, p.sender_name, p.receiver_name, p.mode_label,
-                c.buyer_name, c.lot_block, c.lot_lot, c.term_years, c.term_months
+                c.buyer_name, c.lot_block, c.lot_lot, c.term_years, c.term_months,
+                COUNT(*) OVER() AS total_count
            FROM public.payments p
            INNER JOIN public.contracts c ON c.id = p.contract_id
           WHERE c.project_id = $1
-       ORDER BY p.paid_at DESC, p.created_at DESC",
+       ORDER BY p.paid_at DESC, p.created_at DESC
+          LIMIT $2 OFFSET $3",
     )
     .bind(project_id)
+    .bind(page_query.per_page())
+    .bind(page_query.offset())
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -1416,7 +1597,69 @@ pub async fn list_project_payments(
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load payments")
     })?;
 
-    Ok(Json(rows.into_iter().map(row_to_cashflow_payment).collect()))
+    let total = total_count(&rows);
+    Ok(Json(Page::new(
+        rows.into_iter().map(row_to_cashflow_payment).collect(),
+        &page_query,
+        total,
+    )))
+}
+
+#[derive(Serialize)]
+pub struct BuyerContractDetail {
+    pub contracts: Vec<ContractResponse>,
+    pub payments: Vec<CashFlowPaymentResponse>,
+}
+
+/// A single buyer's contracts + payments within a project, scoped in SQL — replaces
+/// what used to be a full project contracts+payments fetch filtered to one buyer in JS.
+pub async fn buyer_detail(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+    Path((project_id, buyer_user_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<BuyerContractDetail>, E> {
+    require_admin(&pool, &headers).await?;
+
+    let contract_rows = sqlx::query(&format!(
+        "SELECT {CONTRACT_COLUMNS_WITH_TOTALS}
+           FROM public.contracts c
+           LEFT JOIN public.users bu ON bu.id = c.buyer_user_id
+           LEFT JOIN public.payments p ON p.contract_id = c.id
+          WHERE c.project_id = $1 AND c.buyer_user_id = $2
+       GROUP BY c.id
+       ORDER BY c.created_at ASC",
+    ))
+    .bind(project_id)
+    .bind(buyer_user_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load contracts")
+    })?;
+
+    let payment_rows = sqlx::query(
+        "SELECT p.id, p.contract_id, p.amount, p.method, p.months_covered, p.paid_at,
+                p.reference_no, p.bank_name, p.sender_name, p.receiver_name, p.mode_label,
+                c.buyer_name, c.lot_block, c.lot_lot, c.term_years, c.term_months
+           FROM public.payments p
+           INNER JOIN public.contracts c ON c.id = p.contract_id
+          WHERE c.project_id = $1 AND c.buyer_user_id = $2
+       ORDER BY p.paid_at DESC, p.created_at DESC",
+    )
+    .bind(project_id)
+    .bind(buyer_user_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load payments")
+    })?;
+
+    Ok(Json(BuyerContractDetail {
+        contracts: contract_rows.into_iter().map(row_to_contract).collect(),
+        payments: payment_rows.into_iter().map(row_to_cashflow_payment).collect(),
+    }))
 }
 
 /// Corrects a Cash Flow entry after the fact (wrong mode/amount/date typed in). Since
