@@ -96,6 +96,14 @@ pub async fn list_contract_split_history(
 #[derive(Deserialize)]
 pub struct ChangeContractSplitInput {
     pub split_months: i32,
+    /// Optional explicit effective date (YYYY-MM-DD), used by the bulk "Commission
+    /// Split" tool so several buyers can be moved onto a new split at the same chosen
+    /// boundary. Must land exactly on the 1st or the 16th of a month (the release
+    /// cadence) and cannot be earlier than the current still-unreleased period — same
+    /// forward-only guarantee as the default now-computed date. Omit to keep the
+    /// existing single-buyer behavior (effective from "now").
+    #[serde(default)]
+    pub effective_period_start: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -181,7 +189,31 @@ pub async fn change_contract_split(
     });
     let genesis_period_start = period_start_containing(genesis_anchor);
 
-    let effective_period_start = effective_period_start_for_now();
+    let earliest_effective = effective_period_start_for_now();
+    let effective_period_start = match p.effective_period_start.as_deref() {
+        Some(raw) => {
+            let parsed = NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d").map_err(|_| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "effective_period_start must be YYYY-MM-DD",
+                )
+            })?;
+            if parsed.day() != 1 && parsed.day() != 16 {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "effective_period_start must be the 1st or the 16th of a month",
+                ));
+            }
+            if parsed < earliest_effective {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "effective_period_start cannot be earlier than the current still-unreleased period",
+                ));
+            }
+            parsed
+        }
+        None => earliest_effective,
+    };
     let now = Utc::now().timestamp();
 
     let mut tx = pool.begin().await.map_err(|e| {

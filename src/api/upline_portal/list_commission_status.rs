@@ -59,7 +59,7 @@ pub async fn list_commission_status(
     let to = parse_optional_ymd(query.to.as_deref(), "to")?;
 
     let rows = sqlx::query(
-        "SELECT id, project_id, subject_agent_id, period_start, period_end,
+        "SELECT id, project_id, subject_agent_id, row_key, period_start, period_end,
                 status, partial_amount, partial_paid_at, updated_at,
                 COUNT(*) OVER() AS total_count
            FROM public.commission_period_status

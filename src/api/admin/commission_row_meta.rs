@@ -22,6 +22,9 @@ pub struct CommissionRowMetaResponse {
     pub row_key: String,
     pub period_start: String,
     pub other_flag: String,
+    /// Manual override for this row/period's displayed commission amount (Promo view
+    /// only) — NULL means "use the automatic computed amount".
+    pub override_amount: Option<f64>,
     pub updated_at: i64,
 }
 
@@ -36,6 +39,8 @@ pub struct UpsertCommissionRowMetaInput {
     pub row_key: String,
     pub period_start: String,
     pub other_flag: String,
+    #[serde(default)]
+    pub override_amount: Option<f64>,
 }
 
 fn parse_date(value: &str) -> Result<NaiveDate, E> {
@@ -60,6 +65,7 @@ fn row_to_meta(row: sqlx::postgres::PgRow) -> CommissionRowMetaResponse {
         row_key: row.try_get("row_key").unwrap_or_default(),
         period_start: format_date(period_start),
         other_flag: row.try_get("other_flag").unwrap_or_else(|_| "none".into()),
+        override_amount: row.try_get("override_amount").ok().flatten(),
         updated_at: row.try_get("updated_at").unwrap_or(0),
     }
 }
@@ -98,8 +104,8 @@ pub async fn list_commission_row_meta(
         .filter(|s| !s.is_empty());
 
     let rows = sqlx::query(
-        "SELECT id, project_id, subject_agent_id, row_key, period_start, other_flag, updated_at,
-                COUNT(*) OVER() AS total_count
+        "SELECT id, project_id, subject_agent_id, row_key, period_start, other_flag,
+                override_amount, updated_at, COUNT(*) OVER() AS total_count
            FROM public.commission_row_meta
           WHERE project_id = $1
             AND ($2::text IS NULL OR subject_agent_id = $2)
@@ -151,24 +157,35 @@ pub async fn upsert_commission_row_meta(
             "other_flag must be none, half, or full",
         ));
     }
+    if let Some(amount) = p.override_amount
+        && (!amount.is_finite() || amount < 0.0)
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "override_amount must be a non-negative number",
+        ));
+    }
 
     let period_start = parse_date(&p.period_start)?;
     let now = Utc::now().timestamp();
 
     let row = sqlx::query(
         "INSERT INTO public.commission_row_meta (
-            project_id, subject_agent_id, row_key, period_start, other_flag, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6)
+            project_id, subject_agent_id, row_key, period_start, other_flag, override_amount, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (project_id, subject_agent_id, row_key, period_start) DO UPDATE
             SET other_flag = EXCLUDED.other_flag,
+                override_amount = EXCLUDED.override_amount,
                 updated_at = EXCLUDED.updated_at
-      RETURNING id, project_id, subject_agent_id, row_key, period_start, other_flag, updated_at",
+      RETURNING id, project_id, subject_agent_id, row_key, period_start, other_flag,
+                override_amount, updated_at",
     )
     .bind(project_id)
     .bind(subject)
     .bind(row_key)
     .bind(period_start)
     .bind(&p.other_flag)
+    .bind(p.override_amount)
     .bind(now)
     .fetch_one(&pool)
     .await

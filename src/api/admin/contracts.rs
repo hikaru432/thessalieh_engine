@@ -1883,6 +1883,129 @@ pub async fn delete_contract(
 }
 
 #[derive(Deserialize)]
+pub struct BulkDeleteContractsInput {
+    pub ids: Vec<Uuid>,
+}
+
+const BULK_DELETE_MAX: usize = 100;
+
+/// Project-scoped bulk delete — same side effects as `delete_contract` (payments
+/// cascade, lots cleared back to Available, commission_row_meta cleaned), but in
+/// one transaction so a partial failure cannot leave some contracts deleted and
+/// others intact. IDs that don't belong to `project_id` are treated as not found.
+pub async fn bulk_delete_contracts(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+    Path(project_id): Path<Uuid>,
+    Json(p): Json<BulkDeleteContractsInput>,
+) -> Result<StatusCode, E> {
+    require_admin(&pool, &headers).await?;
+
+    let mut ids = p.ids;
+    ids.sort_unstable();
+    ids.dedup();
+
+    if ids.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "No contract ids provided",
+        ));
+    }
+    if ids.len() > BULK_DELETE_MAX {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Cannot delete more than 100 contracts at once",
+        ));
+    }
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to start transaction",
+        )
+    })?;
+
+    let rows = sqlx::query(
+        "SELECT id, lot_id FROM public.contracts WHERE project_id = $1 AND id = ANY($2)",
+    )
+    .bind(project_id)
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+    })?;
+
+    if rows.len() != ids.len() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "One or more contracts were not found in this project",
+        ));
+    }
+
+    let mut lot_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|row| row.try_get::<Option<Uuid>, _>("lot_id").ok().flatten())
+        .collect();
+    lot_ids.sort_unstable();
+    lot_ids.dedup();
+
+    sqlx::query("DELETE FROM public.contracts WHERE project_id = $1 AND id = ANY($2)")
+        .bind(project_id)
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to delete contracts",
+            )
+        })?;
+
+    if !lot_ids.is_empty() {
+        sqlx::query(
+            "UPDATE public.lots
+                SET owner_buyer = NULL, on_hold = false, status = 'Available', reserved_until = NULL,
+                    reserve_agent_id = NULL, reserve_notes = ''
+              WHERE id = ANY($1)",
+        )
+        .bind(&lot_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to sync lot")
+        })?;
+    }
+
+    let row_keys: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+    sqlx::query("DELETE FROM public.commission_row_meta WHERE row_key = ANY($1)")
+        .bind(&row_keys)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to clean up commission row meta",
+            )
+        })?;
+
+    tx.commit().await.map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to commit bulk delete",
+        )
+    })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
 pub struct PenaltyWaiverInput {
     /// Unpaid installments due on or before this date are exempt from the late
     /// penalty. Pass null to clear an existing waiver.

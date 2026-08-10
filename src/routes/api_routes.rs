@@ -257,6 +257,10 @@ pub fn routes() -> Router {
             get(contracts::list_contracts).post(contracts::create_contract),
         )
         .route(
+            "/projects/{project_id}/contracts/bulk-delete",
+            post(contracts::bulk_delete_contracts),
+        )
+        .route(
             "/projects/{project_id}/payments",
             get(contracts::list_project_payments),
         )
