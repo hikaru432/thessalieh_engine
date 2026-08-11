@@ -157,9 +157,15 @@ pub async fn change_contract_split(
         ));
     }
 
+    // Joined against projects/company_id (rather than a bare contract lookup) so this
+    // endpoint enforces the same tenant scoping its sibling admin endpoints already do
+    // via ensure_project — a contract belonging to a project outside this company must
+    // 404 exactly like it would if the project itself didn't exist.
     let contract = sqlx::query(
-        "SELECT agent_commission_split_months, approval_at, updated_at
-           FROM public.contracts WHERE id = $1",
+        "SELECT c.agent_commission_split_months, c.approval_at, c.updated_at
+           FROM public.contracts c
+           JOIN public.projects p ON p.id = c.project_id
+          WHERE c.id = $1 AND p.company_id = 1",
     )
     .bind(contract_id)
     .fetch_optional(&pool)
@@ -173,12 +179,6 @@ pub async fn change_contract_split(
     let current_split_months: i32 = contract
         .try_get("agent_commission_split_months")
         .unwrap_or(36);
-    if current_split_months == p.split_months {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "New split months must differ from the current value",
-        ));
-    }
 
     let approval_at: Option<NaiveDate> = contract.try_get("approval_at").ok().flatten();
     let updated_at: i64 = contract.try_get("updated_at").unwrap_or(0);
@@ -221,16 +221,63 @@ pub async fn change_contract_split(
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start transaction")
     })?;
 
-    let has_history: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM public.contract_split_history WHERE contract_id = $1)",
+    // Locking the contract row here (rather than just re-reading it) closes the
+    // TOCTOU gap where two concurrent split changes on the same contract could both
+    // read the same "current" state and both proceed — the loser now blocks until
+    // the winner's transaction commits, then re-validates against its result.
+    sqlx::query("SELECT id FROM public.contracts WHERE id = $1 FOR UPDATE")
+        .bind(contract_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to lock contract")
+        })?
+        .ok_or((StatusCode::NOT_FOUND, "Contract not found"))?;
+
+    let existing_history: Vec<(NaiveDate, i32)> = sqlx::query(
+        "SELECT effective_period_start, split_months
+           FROM public.contract_split_history
+          WHERE contract_id = $1
+       ORDER BY effective_period_start ASC",
     )
     .bind(contract_id)
-    .fetch_one(&mut *tx)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| {
         tracing::error!("DB: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to check split history")
-    })?;
+    })?
+    .into_iter()
+    .map(|row| {
+        (
+            row.try_get::<NaiveDate, _>("effective_period_start")
+                .unwrap_or(genesis_period_start),
+            row.try_get::<i32, _>("split_months").unwrap_or(current_split_months),
+        )
+    })
+    .collect();
+    let has_history = !existing_history.is_empty();
+
+    // What split_months would actually be active at the CHOSEN effective date under
+    // the history as it stands right now (before this change) — the correct thing to
+    // compare the new value against. Comparing against `contracts.agent_commission_split_months`
+    // instead (as this used to) is wrong once any change has ever been scheduled for
+    // the future: that flat column reflected the LAST-SAVED value regardless of
+    // whether it had actually taken effect yet, so re-targeting the same split months
+    // at a corrected effective date was rejected as a false "no change" duplicate.
+    let active_before = existing_history
+        .iter()
+        .filter(|(start, _)| *start <= effective_period_start)
+        .next_back()
+        .map(|(_, months)| *months)
+        .unwrap_or(current_split_months);
+    if active_before == p.split_months {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "New split months must differ from what would be active at the chosen effective date",
+        ));
+    }
 
     if !has_history {
         sqlx::query(
@@ -276,10 +323,22 @@ pub async fn change_contract_split(
         )
     })?;
 
+    // The flat column is a cache of "whatever's actually active right now" for
+    // display/validation purposes (the real per-period math always comes from
+    // history — see splitSegments.ts). Setting it to `p.split_months` unconditionally
+    // was the bug: a FUTURE-dated change (effective_period_start > earliest_effective)
+    // isn't active yet, so the column must keep showing whatever's active today until
+    // that date actually arrives.
+    let current_active = if effective_period_start <= earliest_effective {
+        p.split_months
+    } else {
+        active_before
+    };
+
     sqlx::query(
         "UPDATE public.contracts SET agent_commission_split_months = $1, updated_at = $2 WHERE id = $3",
     )
-    .bind(p.split_months)
+    .bind(current_active)
     .bind(now)
     .bind(contract_id)
     .execute(&mut *tx)

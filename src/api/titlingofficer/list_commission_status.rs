@@ -14,7 +14,6 @@ use crate::api::pagination::{Page, PageQuery, total_count};
 use crate::api::shared::require_session_user;
 use crate::api::users::shared::E;
 
-use super::agents::{load_project_agents, resolve_to_subject_id};
 use super::guards::{assert_to_owns_project, require_titling_officer};
 
 fn parse_optional_ymd(value: Option<&str>, field: &'static str) -> Result<Option<NaiveDate>, E> {
@@ -44,20 +43,14 @@ pub async fn list_commission_status(
 ) -> Result<Json<Page<CommissionPeriodStatusResponse>>, E> {
     let (user_id, role) = require_session_user(&pool, &headers).await?;
     require_titling_officer(&role)?;
-    assert_to_owns_project(&pool, user_id, project_id).await?;
-
-    let (agents_json, to_roster_id) = load_project_agents(&pool, project_id).await?;
-    let subject_id = resolve_to_subject_id(&agents_json, to_roster_id).ok_or((
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "Titling Officer not found on project",
-    ))?;
+    let subject_id = assert_to_owns_project(&pool, user_id, project_id).await?.to_string();
 
     let from = parse_optional_ymd(query.from.as_deref(), "from")?;
     let to = parse_optional_ymd(query.to.as_deref(), "to")?;
 
     let rows = sqlx::query(
         "SELECT id, project_id, subject_agent_id, row_key, period_start, period_end,
-                status, partial_amount, partial_paid_at, updated_at,
+                status, partial_amount, partial_paid_at, paid_at, updated_at,
                 COUNT(*) OVER() AS total_count
            FROM public.commission_period_status
           WHERE project_id = $1

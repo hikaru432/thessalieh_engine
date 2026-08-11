@@ -78,8 +78,3 @@ pub(super) async fn load_project_agents(
         row.try_get("lead_broker_roster_id").ok().flatten(),
     ))
 }
-
-pub(super) fn resolve_lb_subject_id(agents: &Value, lead_broker_roster_id: Option<Uuid>) -> Option<String> {
-    lead_broker_id_from_agents(agents)
-        .or_else(|| lead_broker_roster_id.map(|id| id.to_string()))
-}

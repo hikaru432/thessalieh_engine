@@ -1832,6 +1832,152 @@ pub async fn update_payment(
     Ok(Json(row_to_payment(row)))
 }
 
+/// Removes a mistakenly recorded Cash Flow entry. Since removing a payment can
+/// shrink `total_paid` below the contract price and shift the due-date schedule,
+/// this replays the same due-date recompute + lot re-sync as `update_payment`.
+pub async fn delete_payment(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, E> {
+    require_admin(&pool, &headers).await?;
+
+    let contract_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT contract_id FROM public.payments WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+            })?;
+
+    let contract_id = contract_id.ok_or((StatusCode::NOT_FOUND, "Payment not found"))?;
+
+    sqlx::query("DELETE FROM public.payments WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to delete payment")
+        })?;
+
+    let contract_row = sqlx::query(
+        "SELECT lot_id, buyer_name, payment_plan, contract_price, due_day, initial_payment,
+                approval_at, amort_start_date, monthly_amortization, first_installment_amount,
+                term_years, term_months, next_due_date, updated_at
+           FROM public.contracts WHERE id = $1",
+    )
+    .bind(contract_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+    })?;
+
+    if let Some(contract_row) = contract_row {
+        let lot_id: Option<Uuid> = contract_row.try_get("lot_id").ok().flatten();
+        let buyer_name: String = contract_row.try_get("buyer_name").unwrap_or_default();
+        let payment_plan: String = contract_row.try_get("payment_plan").unwrap_or_default();
+        let contract_price: f64 = contract_row.try_get("contract_price").unwrap_or(0.0);
+        let due_day: i32 = contract_row.try_get("due_day").unwrap_or(15);
+        let initial_payment: f64 = contract_row.try_get("initial_payment").unwrap_or(0.0);
+        let approval_at: Option<NaiveDate> = contract_row.try_get("approval_at").ok().flatten();
+        let amort_start_date: Option<NaiveDate> =
+            contract_row.try_get("amort_start_date").ok().flatten();
+        let monthly_amortization: f64 = contract_row.try_get("monthly_amortization").unwrap_or(0.0);
+        let first_installment_amount: Option<f64> =
+            contract_row.try_get("first_installment_amount").ok().flatten();
+        let term_years: i32 = contract_row.try_get("term_years").unwrap_or(0);
+        let term_months: i32 = contract_row.try_get("term_months").unwrap_or(0);
+        let current_due_date: NaiveDate = contract_row
+            .try_get("next_due_date")
+            .unwrap_or_else(|_| Utc::now().date_naive());
+        let updated_at_ts: i64 = contract_row.try_get("updated_at").unwrap_or(0);
+
+        let anchor = amort_start_date.or(approval_at).unwrap_or_else(|| {
+            DateTime::from_timestamp(updated_at_ts, 0)
+                .map(|dt| dt.date_naive())
+                .unwrap_or_else(|| Utc::now().date_naive())
+        });
+        let total_months = if term_months > 0 {
+            term_months
+        } else if term_years > 0 {
+            term_years * 12
+        } else {
+            1
+        };
+
+        let payment_rows = sqlx::query(
+            "SELECT amount, paid_at, months_covered FROM public.payments WHERE contract_id = $1",
+        )
+        .bind(contract_id)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+        })?;
+
+        let payments_for_schedule: Vec<(f64, NaiveDate, i32)> = payment_rows
+            .iter()
+            .map(|r| {
+                (
+                    r.try_get::<f64, _>("amount").unwrap_or(0.0),
+                    r.try_get::<NaiveDate, _>("paid_at").unwrap_or(anchor),
+                    r.try_get::<i32, _>("months_covered").unwrap_or(1),
+                )
+            })
+            .collect();
+
+        let next_due_date = compute_next_unpaid_due_date(
+            anchor,
+            due_day,
+            initial_payment,
+            approval_at,
+            monthly_amortization,
+            first_installment_amount,
+            total_months,
+            &payments_for_schedule,
+        )
+        .unwrap_or(current_due_date);
+
+        let total_paid: f64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(amount), 0) FROM public.payments WHERE contract_id = $1",
+        )
+        .bind(contract_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0.0);
+
+        sqlx::query("UPDATE public.contracts SET next_due_date = $1, updated_at = $2 WHERE id = $3")
+            .bind(next_due_date)
+            .bind(Utc::now().timestamp())
+            .bind(contract_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to update contract")
+            })?;
+
+        if let Some(lot_id) = lot_id {
+            sync_lot_for_contract(
+                &pool,
+                lot_id,
+                &buyer_name,
+                &payment_plan,
+                total_paid >= contract_price && contract_price > 0.0,
+            )
+            .await?;
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn delete_contract(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,

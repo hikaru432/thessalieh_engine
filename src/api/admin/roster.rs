@@ -153,24 +153,43 @@ async fn get_agent_pool_cap(pool: &PgPool) -> Result<f64, E> {
     Ok(cap.unwrap_or(12.0))
 }
 
-async fn validate_broker_upline(pool: &PgPool, broker_id: Uuid) -> Result<(), E> {
-    let role: Option<String> = sqlx::query_scalar(
-        "SELECT role FROM public.roster WHERE id = $1",
-    )
-    .bind(broker_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
-    })?;
+/// `unchanged_from` is the agent's OWN broker_id before this save (None for a brand
+/// new roster entry). Reassigning to the SAME upline is always allowed even if that
+/// upline has since been marked Inactive — otherwise merely saving an unrelated field
+/// on this agent's own roster entry would be blocked by someone else's status change.
+async fn validate_broker_upline(
+    pool: &PgPool,
+    broker_id: Uuid,
+    unchanged_from: Option<Uuid>,
+) -> Result<(), E> {
+    if unchanged_from == Some(broker_id) {
+        return Ok(());
+    }
 
-    let Some(role) = role else {
+    let row = sqlx::query("SELECT role, status FROM public.roster WHERE id = $1")
+        .bind(broker_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+        })?;
+
+    let Some(row) = row else {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "Referenced user or broker not found",
         ));
     };
+    let role: String = row.try_get("role").unwrap_or_default();
+    let status: String = row.try_get("status").unwrap_or_default();
+
+    if status != "Active" {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Upline must be Active to accept new agents",
+        ));
+    }
 
     let upline_labels = fetch_upline_role_labels(pool).await?;
     if upline_labels.iter().any(|label| label == &role) {
@@ -333,7 +352,7 @@ pub async fn create_roster_entry(
     validate_roster_input(&p, None, agent_pool_cap, &upline_labels)?;
     if p.role == "Agent" {
         if let Some(broker_id) = p.broker_id {
-            validate_broker_upline(&pool, broker_id).await?;
+            validate_broker_upline(&pool, broker_id, None).await?;
         }
     }
 
@@ -398,7 +417,17 @@ pub async fn update_roster_entry(
     validate_roster_input(&p, Some(id), agent_pool_cap, &upline_labels)?;
     if p.role == "Agent" {
         if let Some(broker_id) = p.broker_id {
-            validate_broker_upline(&pool, broker_id).await?;
+            let current_broker_id: Option<Uuid> =
+                sqlx::query_scalar::<_, Option<Uuid>>("SELECT broker_id FROM public.roster WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("DB: {e}");
+                        (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
+                    })?
+                    .flatten();
+            validate_broker_upline(&pool, broker_id, current_broker_id).await?;
         }
     }
 

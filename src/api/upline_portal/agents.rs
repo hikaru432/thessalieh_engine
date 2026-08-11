@@ -88,7 +88,3 @@ pub(super) async fn load_project_agents(
         row.try_get("legacy_root_id").ok().flatten(),
     ))
 }
-
-pub(super) fn resolve_subject_id(agents: &Value, role_slug: &str, legacy_root_id: Option<Uuid>) -> Option<String> {
-    root_id_from_agents(agents, role_slug).or_else(|| legacy_root_id.map(|id| id.to_string()))
-}

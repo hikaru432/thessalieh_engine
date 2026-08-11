@@ -1,4 +1,5 @@
 pub mod commission_rates;
+pub mod commission_release_credits;
 pub mod commission_release_entries;
 pub mod commission_row_meta;
 pub mod commission_split_schedule;

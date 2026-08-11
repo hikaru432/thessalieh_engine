@@ -25,6 +25,11 @@ pub struct CommissionPeriodStatusResponse {
     pub status: String,
     pub partial_amount: Option<f64>,
     pub partial_paid_at: Option<String>,
+    /// The date this period actually transitioned to "paid" — set once, then
+    /// preserved across later re-saves that keep it paid (unlike `updated_at`,
+    /// which bumps on every save regardless of whether status changed). Null
+    /// whenever status isn't "paid".
+    pub paid_at: Option<String>,
     pub updated_at: i64,
 }
 
@@ -69,6 +74,7 @@ pub(crate) fn row_to_status(row: sqlx::postgres::PgRow) -> CommissionPeriodStatu
     let period_start: NaiveDate = row.try_get("period_start").unwrap_or_default();
     let period_end: NaiveDate = row.try_get("period_end").unwrap_or_default();
     let partial_paid_at: Option<NaiveDate> = row.try_get("partial_paid_at").ok().flatten();
+    let paid_at: Option<NaiveDate> = row.try_get("paid_at").ok().flatten();
     CommissionPeriodStatusResponse {
         id: row.try_get("id").unwrap_or_default(),
         project_id: row.try_get("project_id").unwrap_or_default(),
@@ -79,6 +85,7 @@ pub(crate) fn row_to_status(row: sqlx::postgres::PgRow) -> CommissionPeriodStatu
         status: row.try_get("status").unwrap_or_else(|_| "not_yet".into()),
         partial_amount: row.try_get("partial_amount").ok().flatten(),
         partial_paid_at: partial_paid_at.map(format_date),
+        paid_at: paid_at.map(format_date),
         updated_at: row.try_get("updated_at").unwrap_or(0),
     }
 }
@@ -123,7 +130,7 @@ pub async fn list_commission_status(
 
     let rows = sqlx::query(
         "SELECT id, project_id, subject_agent_id, row_key, period_start, period_end,
-                status, partial_amount, partial_paid_at, updated_at,
+                status, partial_amount, partial_paid_at, paid_at, updated_at,
                 COUNT(*) OVER() AS total_count
            FROM public.commission_period_status
           WHERE project_id = $1
@@ -214,20 +221,34 @@ pub async fn upsert_commission_status(
     };
 
     let now = Utc::now().timestamp();
+    // Only used as the value for a brand-new row, or the first time an existing row
+    // transitions to "paid" (see the COALESCE in the UPDATE branch below, which keeps
+    // whatever paid_at was already recorded across any later re-save that leaves the
+    // row paid).
+    let paid_at_if_new = if p.status == "paid" {
+        Some(Utc::now().date_naive())
+    } else {
+        None
+    };
 
     let row = sqlx::query(
         "INSERT INTO public.commission_period_status (
             project_id, subject_agent_id, row_key, period_start, period_end,
-            status, partial_amount, partial_paid_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            status, partial_amount, partial_paid_at, paid_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (project_id, subject_agent_id, row_key, period_start) DO UPDATE
             SET period_end = EXCLUDED.period_end,
                 status = EXCLUDED.status,
                 partial_amount = EXCLUDED.partial_amount,
                 partial_paid_at = EXCLUDED.partial_paid_at,
+                paid_at = CASE
+                    WHEN EXCLUDED.status = 'paid'
+                        THEN COALESCE(public.commission_period_status.paid_at, EXCLUDED.paid_at)
+                    ELSE NULL
+                END,
                 updated_at = EXCLUDED.updated_at
       RETURNING id, project_id, subject_agent_id, row_key, period_start, period_end,
-                status, partial_amount, partial_paid_at, updated_at",
+                status, partial_amount, partial_paid_at, paid_at, updated_at",
     )
     .bind(project_id)
     .bind(subject)
@@ -237,6 +258,7 @@ pub async fn upsert_commission_status(
     .bind(&p.status)
     .bind(partial_amount)
     .bind(partial_paid_at)
+    .bind(paid_at_if_new)
     .bind(now)
     .fetch_one(&pool)
     .await

@@ -14,7 +14,6 @@ use crate::api::pagination::{Page, PageQuery, total_count};
 use crate::api::shared::require_session_user;
 use crate::api::users::shared::E;
 
-use super::agents::{load_project_agents, resolve_subject_id};
 use super::guards::{assert_owns_project, require_upline_role};
 
 fn parse_optional_ymd(value: Option<&str>, field: &'static str) -> Result<Option<NaiveDate>, E> {
@@ -46,13 +45,7 @@ pub async fn list_commission_status(
 ) -> Result<Json<Page<CommissionPeriodStatusResponse>>, E> {
     let (user_id, role) = require_session_user(&pool, &headers).await?;
     let label = require_upline_role(&pool, &role_slug, &role).await?;
-    assert_owns_project(&pool, user_id, project_id, &role_slug).await?;
-
-    let (agents_json, legacy_root_id) = load_project_agents(&pool, project_id, &role_slug).await?;
-    let subject_id = resolve_subject_id(&agents_json, &role_slug, legacy_root_id).ok_or((
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "Subject not found on project",
-    ))?;
+    let subject_id = assert_owns_project(&pool, user_id, project_id, &role_slug).await?.to_string();
     let _ = &label; // role validated above; kept for symmetry with sibling handlers
 
     let from = parse_optional_ymd(query.from.as_deref(), "from")?;
@@ -60,7 +53,7 @@ pub async fn list_commission_status(
 
     let rows = sqlx::query(
         "SELECT id, project_id, subject_agent_id, row_key, period_start, period_end,
-                status, partial_amount, partial_paid_at, updated_at,
+                status, partial_amount, partial_paid_at, paid_at, updated_at,
                 COUNT(*) OVER() AS total_count
            FROM public.commission_period_status
           WHERE project_id = $1

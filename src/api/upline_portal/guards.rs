@@ -28,6 +28,14 @@ pub(super) async fn require_upline_role(pool: &PgPool, role_slug: &str, session_
     }
 }
 
+/// Confirms the caller is assigned to `role_slug` on this project AND returns their
+/// own roster id — the only correct "subject" for anything this caller fetches under
+/// `/me/upline/{role_slug}/...`. Never resolve the subject by re-scanning agents_json
+/// for "the" entry with this role elsewhere: a project can (transiently, e.g.
+/// mid-reassignment) carry more than one agents_json entry sharing a role, and picking
+/// the first one instead of the caller's own id would leak another subject's
+/// commission data to whoever happens to be listed first.
+///
 /// `lead-broker`/`titling-officer` also have a dedicated projects column as a legacy
 /// fallback alongside the agents_json check; any other (custom) role relies on agents_json
 /// alone, since there's no per-role dedicated column for those.
@@ -36,41 +44,35 @@ pub(super) async fn assert_owns_project(
     user_id: Uuid,
     project_id: Uuid,
     role_slug: &str,
-) -> Result<(), E> {
-    let owned: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1
-              FROM public.projects p
-              JOIN public.roster r ON r.user_id = $2
-             WHERE p.id = $1
-               AND (
-                 ($3 = 'lead-broker' AND p.lead_broker_roster_id = r.id)
-                 OR ($3 = 'titling-officer' AND p.titling_officer_roster_id = r.id)
-                 OR EXISTS (
-                   SELECT 1
-                     FROM jsonb_array_elements(p.agents_json) AS a
-                    WHERE a->>'role' = $3
-                      AND a->>'id' = r.id::text
-                 )
-               )
-         )",
+) -> Result<Uuid, E> {
+    let roster_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT r.id
+           FROM public.projects p
+           JOIN public.roster r ON r.user_id = $2
+          WHERE p.id = $1
+            AND (
+              ($3 = 'lead-broker' AND p.lead_broker_roster_id = r.id)
+              OR ($3 = 'titling-officer' AND p.titling_officer_roster_id = r.id)
+              OR EXISTS (
+                SELECT 1
+                  FROM jsonb_array_elements(p.agents_json) AS a
+                 WHERE a->>'role' = $3
+                   AND a->>'id' = r.id::text
+              )
+            )",
     )
     .bind(project_id)
     .bind(user_id)
     .bind(role_slug)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .map_err(|e| {
         tracing::error!("DB: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
     })?;
 
-    if owned {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::FORBIDDEN,
-            "Not assigned to this role on this project",
-        ))
-    }
+    roster_id.ok_or((
+        StatusCode::FORBIDDEN,
+        "Not assigned to this role on this project",
+    ))
 }

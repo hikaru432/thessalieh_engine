@@ -78,8 +78,3 @@ pub(super) async fn load_project_agents(
         row.try_get("titling_officer_roster_id").ok().flatten(),
     ))
 }
-
-pub(super) fn resolve_to_subject_id(agents: &Value, titling_officer_roster_id: Option<Uuid>) -> Option<String> {
-    titling_officer_id_from_agents(agents)
-        .or_else(|| titling_officer_roster_id.map(|id| id.to_string()))
-}

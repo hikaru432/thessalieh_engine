@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use crate::api::admin::{
-    commission_rates, commission_release_entries, commission_row_meta, commission_split_schedule,
-    commission_status, company, contract_split_history, contracts, installment_status_overrides,
-    lots, projects, roster, upline_role_types,
+    commission_rates, commission_release_credits, commission_release_entries, commission_row_meta,
+    commission_split_schedule, commission_status, company, contract_split_history, contracts,
+    installment_status_overrides, lots, projects, roster, upline_role_types,
 };
 use crate::api::buyer;
 use crate::api::leadbroker;
@@ -79,6 +79,14 @@ pub fn routes() -> Router {
             "/me/lb/projects/{project_id}/commission-status",
             get(leadbroker::list_commission_status),
         )
+        .route(
+            "/me/lb/projects/{project_id}/commission-release-entries",
+            get(leadbroker::list_commission_release_entries),
+        )
+        .route(
+            "/me/lb/projects/{project_id}/commission-release-credits",
+            get(leadbroker::list_commission_release_credits),
+        )
         .route("/me/lb/lots/{id}", patch(leadbroker::patch_lot_reserve))
         .route("/me/to/projects", get(titlingofficer::list_my_projects))
         .route(
@@ -100,6 +108,14 @@ pub fn routes() -> Router {
         .route(
             "/me/to/projects/{project_id}/commission-status",
             get(titlingofficer::list_commission_status),
+        )
+        .route(
+            "/me/to/projects/{project_id}/commission-release-entries",
+            get(titlingofficer::list_commission_release_entries),
+        )
+        .route(
+            "/me/to/projects/{project_id}/commission-release-credits",
+            get(titlingofficer::list_commission_release_credits),
         )
         .route("/me/to/lots/{id}", patch(titlingofficer::patch_lot_reserve))
         .route(
@@ -127,6 +143,14 @@ pub fn routes() -> Router {
             get(upline_portal::list_commission_status),
         )
         .route(
+            "/me/upline/{role_slug}/projects/{project_id}/commission-release-entries",
+            get(upline_portal::list_commission_release_entries),
+        )
+        .route(
+            "/me/upline/{role_slug}/projects/{project_id}/commission-release-credits",
+            get(upline_portal::list_commission_release_credits),
+        )
+        .route(
             "/me/upline/{role_slug}/lots/{id}",
             patch(upline_portal::patch_lot_reserve),
         )
@@ -146,6 +170,14 @@ pub fn routes() -> Router {
         .route(
             "/me/agent/projects/{project_id}/commission-status",
             get(agent::list_commission_status),
+        )
+        .route(
+            "/me/agent/projects/{project_id}/commission-release-entries",
+            get(agent::list_commission_release_entries),
+        )
+        .route(
+            "/me/agent/projects/{project_id}/commission-release-credits",
+            get(agent::list_commission_release_credits),
         )
         .route(
             "/company/settings",
@@ -228,6 +260,15 @@ pub fn routes() -> Router {
             axum::routing::delete(commission_release_entries::delete_commission_release_entry),
         )
         .route(
+            "/projects/{project_id}/commission-release-credits",
+            get(commission_release_credits::list_commission_release_credits)
+                .post(commission_release_credits::create_commission_release_credit),
+        )
+        .route(
+            "/commission-release-credits/{credit_id}",
+            axum::routing::delete(commission_release_credits::delete_commission_release_credit),
+        )
+        .route(
             "/projects/{project_id}/installment-status",
             get(installment_status_overrides::list_installment_status_overrides)
                 .put(installment_status_overrides::upsert_installment_status_override),
@@ -276,7 +317,7 @@ pub fn routes() -> Router {
         )
         .route(
             "/payments/{id}",
-            patch(contracts::update_payment),
+            patch(contracts::update_payment).delete(contracts::delete_payment),
         )
         .route(
             "/contracts/{id}/penalty-waiver",
