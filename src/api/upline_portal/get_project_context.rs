@@ -7,18 +7,18 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::api::admin::commission_rates::CommissionRateResponse;
+use crate::api::admin::project_rate_config::{ProjectRateConfigResponse, fetch_project_rate_config};
 use crate::api::admin::projects::ProjectResponse;
 use crate::api::shared::require_session_user;
 use crate::api::users::shared::E;
 
 use super::guards::{assert_owns_project, require_upline_role};
-use super::rows::{PROJECT_COLUMNS, row_to_project, row_to_rate};
+use super::rows::{PROJECT_COLUMNS, row_to_project};
 
 #[derive(Serialize)]
 pub struct UplineContextResponse {
     pub project: ProjectResponse,
-    pub rates: Vec<CommissionRateResponse>,
+    pub rate_config: ProjectRateConfigResponse,
 }
 
 /// GET /me/upline/{role_slug}/projects/{project_id}/context
@@ -43,18 +43,10 @@ pub async fn get_project_context(
     })?
     .ok_or((StatusCode::NOT_FOUND, "Project not found"))?;
 
-    let rate_rows = sqlx::query(
-        "SELECT role, commission_rate, updated_at FROM public.commission_rates ORDER BY role ASC",
-    )
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load rates")
-    })?;
+    let rate_config = fetch_project_rate_config(&pool, project_id).await?;
 
     Ok(Json(UplineContextResponse {
         project: row_to_project(row),
-        rates: rate_rows.into_iter().map(row_to_rate).collect(),
+        rate_config,
     }))
 }

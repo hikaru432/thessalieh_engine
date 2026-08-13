@@ -1,7 +1,6 @@
 use serde_json::Value;
 use sqlx::Row;
 
-use crate::api::admin::commission_rates::CommissionRateResponse;
 use crate::api::admin::projects::ProjectResponse;
 
 pub(super) fn row_to_project(row: sqlx::postgres::PgRow) -> ProjectResponse {
@@ -15,14 +14,6 @@ pub(super) fn row_to_project(row: sqlx::postgres::PgRow) -> ProjectResponse {
         agents_json: row
             .try_get("agents_json")
             .unwrap_or_else(|_| Value::Array(vec![])),
-    }
-}
-
-pub(super) fn row_to_rate(row: sqlx::postgres::PgRow) -> CommissionRateResponse {
-    CommissionRateResponse {
-        role: row.try_get("role").unwrap_or_default(),
-        commission_rate: row.try_get("commission_rate").unwrap_or(0.0),
-        updated_at: row.try_get("updated_at").unwrap_or(0),
     }
 }
 

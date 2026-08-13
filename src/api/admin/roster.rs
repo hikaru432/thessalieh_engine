@@ -140,17 +140,13 @@ fn validate_roster_input(
     Ok(())
 }
 
-async fn get_agent_pool_cap(pool: &PgPool) -> Result<f64, E> {
-    let cap: Option<f64> = sqlx::query_scalar(
-        "SELECT commission_rate FROM public.commission_rates WHERE role = 'Agent'",
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "DB error")
-    })?;
-    Ok(cap.unwrap_or(12.0))
+/// The agent pool % now varies per project (see `project_rate_config`), but a roster
+/// entry's `commission_rate` is a single company-wide value shared across whatever
+/// projects that agent is assigned to. So this only bounds it to a sane 0-100% range;
+/// the real, project-correct cap is enforced where an agent is actually given a share
+/// within one project's tree (`agents_json` sharePercent on the Marketing page).
+fn agent_pool_cap_ceiling() -> f64 {
+    100.0
 }
 
 /// `unchanged_from` is the agent's OWN broker_id before this save (None for a brand
@@ -212,7 +208,9 @@ fn normalized_commission_rate(role: &str, commission_rate: f64) -> f64 {
 
 /// `roster.role` is already validated (by `validate_roster_input`) to be either "Agent"
 /// or a known upline_role_types label, and both are valid `users.role` values directly.
-async fn sync_user_role(
+/// Also reused as-is by `salary.rs` to sync a linked salary_employees row's account to
+/// "Employee" — the caller is responsible for having already validated `roster_role`.
+pub(crate) async fn sync_user_role(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: Uuid,
     roster_role: &str,
@@ -244,7 +242,7 @@ async fn sync_user_role(
     Ok(())
 }
 
-async fn revert_user_role(
+pub(crate) async fn revert_user_role(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: Uuid,
     now: i64,
@@ -347,7 +345,7 @@ pub async fn create_roster_entry(
     Json(p): Json<RosterInput>,
 ) -> Result<Json<RosterResponse>, E> {
     require_admin(&pool, &headers).await?;
-    let agent_pool_cap = get_agent_pool_cap(&pool).await?;
+    let agent_pool_cap = agent_pool_cap_ceiling();
     let upline_labels = fetch_upline_role_labels(&pool).await?;
     validate_roster_input(&p, None, agent_pool_cap, &upline_labels)?;
     if p.role == "Agent" {
@@ -412,7 +410,7 @@ pub async fn update_roster_entry(
     Json(p): Json<RosterInput>,
 ) -> Result<Json<RosterResponse>, E> {
     require_admin(&pool, &headers).await?;
-    let agent_pool_cap = get_agent_pool_cap(&pool).await?;
+    let agent_pool_cap = agent_pool_cap_ceiling();
     let upline_labels = fetch_upline_role_labels(&pool).await?;
     validate_roster_input(&p, Some(id), agent_pool_cap, &upline_labels)?;
     if p.role == "Agent" {

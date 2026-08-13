@@ -9,6 +9,7 @@ use serde_json::Value;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::api::admin::project_rate_config::seed_project_rate_config;
 use crate::api::shared::require_admin;
 use crate::api::users::shared::E;
 
@@ -244,6 +245,11 @@ pub async fn create_project(
 
     let now = Utc::now().timestamp();
 
+    let mut tx = pool.begin().await.map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create project")
+    })?;
+
     let row = sqlx::query(&format!(
         "INSERT INTO public.projects (company_id, name, created_at, updated_at, agent_commission_split_months, agents_json)
          VALUES (1, $1, $2, $2, 15, '[]'::jsonb)
@@ -251,9 +257,17 @@ pub async fn create_project(
     ))
     .bind(name)
     .bind(now)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create project")
+    })?;
+
+    let project_id: Uuid = row.try_get("id").unwrap_or_default();
+    seed_project_rate_config(&mut tx, project_id).await?;
+
+    tx.commit().await.map_err(|e| {
         tracing::error!("DB: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create project")
     })?;

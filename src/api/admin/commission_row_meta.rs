@@ -79,7 +79,10 @@ async fn ensure_project(pool: &PgPool, project_id: Uuid) -> Result<(), E> {
     .await
     .map_err(|e| {
         tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to verify project")
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to verify project",
+        )
     })?;
     if !exists {
         return Err((StatusCode::NOT_FOUND, "Project not found"));

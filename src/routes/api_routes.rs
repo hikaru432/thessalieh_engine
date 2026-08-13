@@ -12,13 +12,15 @@ use sqlx::PgPool;
 use crate::api::admin::{
     commission_rates, commission_release_credits, commission_release_entries, commission_row_meta,
     commission_split_schedule, commission_status, company, contract_split_history, contracts,
-    installment_status_overrides, lots, projects, roster, upline_role_types,
+    employee_position_types, expenses, installment_status_overrides, lots, project_rate_config,
+    projects, roster, salary, subdivision_layout, upline_role_types,
 };
 use crate::api::buyer;
 use crate::api::leadbroker;
 use crate::api::titlingofficer;
 use crate::api::upline_portal;
 use crate::api::agent;
+use crate::api::employee;
 use crate::api::users;
 
 const BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
@@ -179,6 +181,9 @@ pub fn routes() -> Router {
             "/me/agent/projects/{project_id}/commission-release-credits",
             get(agent::list_commission_release_credits),
         )
+        .route("/me/employee/profile", get(employee::get_my_profile))
+        .route("/me/employee/plans", get(employee::list_my_plans))
+        .route("/me/employee/releases", get(employee::list_my_releases))
         .route(
             "/company/settings",
             get(company::get_settings).patch(company::update_settings),
@@ -233,6 +238,23 @@ pub fn routes() -> Router {
             patch(projects::update_project_agents),
         )
         .route(
+            "/projects/{project_id}/rate-config",
+            get(project_rate_config::get_project_rate_config),
+        )
+        .route(
+            "/projects/{project_id}/rate-config/categories",
+            post(project_rate_config::create_rate_category),
+        )
+        .route(
+            "/projects/{project_id}/rate-config/categories/{id}",
+            patch(project_rate_config::update_rate_category)
+                .delete(project_rate_config::delete_rate_category),
+        )
+        .route(
+            "/projects/{project_id}/rate-config/upline-roles/{slug}",
+            patch(project_rate_config::update_upline_role_rate),
+        )
+        .route(
             "/projects/{project_id}/dashboard-summary",
             get(contracts::project_dashboard_summary),
         )
@@ -267,6 +289,74 @@ pub fn routes() -> Router {
         .route(
             "/commission-release-credits/{credit_id}",
             axum::routing::delete(commission_release_credits::delete_commission_release_credit),
+        )
+        .route(
+            "/expense-categories",
+            get(expenses::list_expense_categories).post(expenses::create_expense_category),
+        )
+        .route(
+            "/expense-categories/{id}",
+            axum::routing::delete(expenses::delete_expense_category),
+        )
+        .route(
+            "/expenses",
+            get(expenses::list_expenses).post(expenses::create_expense),
+        )
+        .route("/expenses-summary", get(expenses::expenses_summary))
+        .route(
+            "/expenses/{id}",
+            patch(expenses::update_expense).delete(expenses::delete_expense),
+        )
+        .route(
+            "/commission-release-summary",
+            get(commission_release_entries::commission_release_summary),
+        )
+        .route(
+            "/salary-release-summary",
+            get(salary::salary_release_summary),
+        )
+        .route(
+            "/salary-employees",
+            get(salary::list_salary_employees).post(salary::create_salary_employee),
+        )
+        .route(
+            "/salary-employees/{employee_id}",
+            patch(salary::update_salary_employee).delete(salary::delete_salary_employee),
+        )
+        .route(
+            "/salary-employees/{employee_id}/plans",
+            get(salary::list_salary_plans).post(salary::create_salary_plan),
+        )
+        .route(
+            "/salary-plans/{plan_id}",
+            patch(salary::update_salary_plan).delete(salary::delete_salary_plan),
+        )
+        .route(
+            "/salary-employees/{employee_id}/releases",
+            get(salary::list_salary_employee_releases),
+        )
+        .route(
+            "/projects/{project_id}/salary-release-entries",
+            get(salary::list_salary_release_entries).post(salary::create_salary_release_entry),
+        )
+        .route(
+            "/salary-release-entries/{entry_id}",
+            axum::routing::delete(salary::delete_salary_release_entry),
+        )
+        .route(
+            "/employee-position-types",
+            get(employee_position_types::list_employee_position_types)
+                .post(employee_position_types::create_employee_position_type),
+        )
+        .route(
+            "/employee-position-types/{id}",
+            patch(employee_position_types::update_employee_position_type)
+                .delete(employee_position_types::delete_employee_position_type),
+        )
+        .route(
+            "/projects/{project_id}/subdivision-layout",
+            get(subdivision_layout::get_subdivision_layout)
+                .put(subdivision_layout::put_subdivision_layout),
         )
         .route(
             "/projects/{project_id}/installment-status",

@@ -196,6 +196,60 @@ pub async fn create_commission_release_entry(
     Ok(Json(row_to_entry(row)))
 }
 
+#[derive(Serialize)]
+pub struct ProjectCommissionReleaseTotal {
+    pub project_id: Uuid,
+    pub project_name: String,
+    pub total: f64,
+}
+
+#[derive(Serialize)]
+pub struct CommissionReleaseSummaryResponse {
+    pub total: f64,
+    pub projects: Vec<ProjectCommissionReleaseTotal>,
+}
+
+/// GET /commission-release-summary — admin only. Company-wide commission-release
+/// total plus a per-project breakdown, for the Cash Out card on the Projects
+/// overview page (a `LEFT JOIN` keeps projects with zero releases in the list, at
+/// total = 0, instead of silently dropping them).
+pub async fn commission_release_summary(
+    Extension(pool): Extension<PgPool>,
+    headers: HeaderMap,
+) -> Result<Json<CommissionReleaseSummaryResponse>, E> {
+    require_admin(&pool, &headers).await?;
+
+    let rows = sqlx::query(
+        "SELECT p.id AS project_id, p.name AS project_name, COALESCE(SUM(e.amount), 0) AS total
+           FROM public.projects p
+           LEFT JOIN public.commission_release_entries e ON e.project_id = p.id
+          WHERE p.company_id = 1
+       GROUP BY p.id, p.name
+       ORDER BY p.created_at ASC",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load commission release summary",
+        )
+    })?;
+
+    let projects: Vec<ProjectCommissionReleaseTotal> = rows
+        .into_iter()
+        .map(|row| ProjectCommissionReleaseTotal {
+            project_id: row.try_get("project_id").unwrap_or_default(),
+            project_name: row.try_get("project_name").unwrap_or_default(),
+            total: row.try_get("total").unwrap_or(0.0),
+        })
+        .collect();
+    let total = projects.iter().map(|p| p.total).sum();
+
+    Ok(Json(CommissionReleaseSummaryResponse { total, projects }))
+}
+
 pub async fn delete_commission_release_entry(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,

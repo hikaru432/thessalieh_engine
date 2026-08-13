@@ -8,13 +8,13 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::api::admin::commission_rates::CommissionRateResponse;
+use crate::api::admin::project_rate_config::{ProjectRateConfigResponse, fetch_project_rate_config};
 use crate::api::admin::projects::ProjectResponse;
 use crate::api::shared::require_session_user;
 use crate::api::users::shared::E;
 
 use super::guards::{require_agent, resolve_agent_roster_id, assert_agent_on_project};
-use super::rows::{PROJECT_COLUMNS, row_to_project, row_to_rate};
+use super::rows::{PROJECT_COLUMNS, row_to_project};
 
 fn agent_name_from_json(agents: &Value, agent_id: &str) -> Option<String> {
     agents.as_array()?.iter().find_map(|a| {
@@ -31,7 +31,7 @@ fn agent_name_from_json(agents: &Value, agent_id: &str) -> Option<String> {
 #[derive(Serialize)]
 pub struct AgentContextResponse {
     pub project: ProjectResponse,
-    pub rates: Vec<CommissionRateResponse>,
+    pub rate_config: ProjectRateConfigResponse,
     pub agent_id: String,
     pub agent_name: String,
 }
@@ -64,19 +64,11 @@ pub async fn get_project_context(
     let agent_name =
         agent_name_from_json(&project.agents_json, &agent_id).unwrap_or_else(|| "Agent".into());
 
-    let rate_rows = sqlx::query(
-        "SELECT role, commission_rate, updated_at FROM public.commission_rates ORDER BY role ASC",
-    )
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load rates")
-    })?;
+    let rate_config = fetch_project_rate_config(&pool, project_id).await?;
 
     Ok(Json(AgentContextResponse {
         project,
-        rates: rate_rows.into_iter().map(row_to_rate).collect(),
+        rate_config,
         agent_id,
         agent_name,
     }))
