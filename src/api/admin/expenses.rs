@@ -71,6 +71,7 @@ pub struct ExpenseCategoryTotal {
 pub struct ExpensesSummaryResponse {
     pub categories: Vec<ExpenseCategoryTotal>,
     pub total: f64,
+    pub salary_release_total: f64,
 }
 
 fn parse_date(value: &str, field: &'static str) -> Result<NaiveDate, E> {
@@ -375,6 +376,12 @@ pub async fn delete_expense(
 /// Per-category totals plus a grand total — the company-wide "Cash Out" overview
 /// cards on the Expenses page. A `LEFT JOIN` keeps categories with zero recorded
 /// expenses in the list (at total = 0) instead of silently dropping them.
+///
+/// `salary_release_total` is pulled in separately from the project-scoped
+/// `salary_release_entries` ledger (same source as `salary_release_summary`) so the
+/// Expenses page can surface it too, without folding salary rows — which carry
+/// `employee_id`/`project_id`/period fields, not a `category_id` — into the
+/// category-shaped `expenses` list itself.
 pub async fn expenses_summary(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,
@@ -409,5 +416,25 @@ pub async fn expenses_summary(
 
     let total = categories.iter().map(|c| c.total).sum();
 
-    Ok(Json(ExpensesSummaryResponse { categories, total }))
+    let salary_release_total: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(sre.amount), 0)
+           FROM public.salary_release_entries sre
+           JOIN public.projects p ON p.id = sre.project_id
+          WHERE p.company_id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load expenses summary",
+        )
+    })?;
+
+    Ok(Json(ExpensesSummaryResponse {
+        categories,
+        total,
+        salary_release_total,
+    }))
 }
