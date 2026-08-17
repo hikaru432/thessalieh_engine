@@ -17,6 +17,9 @@ pub struct UserSummary {
     pub email: String,
     pub role: String,
     pub phone: Option<String>,
+    pub lastname: Option<String>,
+    pub firstname: Option<String>,
+    pub middlename: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -34,7 +37,7 @@ pub async fn list_users(
 
     let rows = if let Some(role) = query.role.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
         sqlx::query(
-            "SELECT id, username, email, role, phone
+            "SELECT id, username, email, role, phone, lastname, firstname, middlename
                FROM public.users
               WHERE role = $1
            ORDER BY username ASC",
@@ -44,7 +47,7 @@ pub async fn list_users(
         .await
     } else {
         sqlx::query(
-            "SELECT id, username, email, role, phone
+            "SELECT id, username, email, role, phone, lastname, firstname, middlename
                FROM public.users
            ORDER BY username ASC",
         )
@@ -64,6 +67,9 @@ pub async fn list_users(
             email: r.try_get("email").unwrap_or_default(),
             role: r.try_get("role").unwrap_or_default(),
             phone: r.try_get("phone").ok().flatten(),
+            lastname: r.try_get("lastname").ok().flatten(),
+            firstname: r.try_get("firstname").ok().flatten(),
+            middlename: r.try_get("middlename").ok().flatten(),
         })
         .collect();
 

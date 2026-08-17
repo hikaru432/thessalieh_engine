@@ -9,7 +9,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::api::pagination::{Page, PageQuery, total_count};
-use crate::api::shared::require_admin;
+use crate::api::shared::{normalize_share_kind, require_admin};
 use crate::api::users::shared::E;
 
 /// A credit grant recorded when a release amount exceeded everything owed at the
@@ -17,6 +17,9 @@ use crate::api::users::shared::E;
 /// creation; `buildCommissionWaterfall` (frontend) recomputes how much of it is
 /// still unapplied on every read, the same way it recomputes carry-forward from
 /// commission_release_entries.
+///
+/// `share_kind` scopes the credit to Baseline (`base`), Direct buyer (`pool`), or
+/// Promo (`promo`). Null for a plain agent's combined ledger.
 #[derive(Serialize)]
 pub struct CommissionReleaseCreditResponse {
     pub id: Uuid,
@@ -149,6 +152,7 @@ pub async fn create_commission_release_credit(
     }
 
     let paid_at = parse_date(&p.paid_at, "paid_at")?;
+    let share_kind = normalize_share_kind(p.share_kind)?;
     let note = p.note.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let now = Utc::now().timestamp();
 
@@ -160,7 +164,7 @@ pub async fn create_commission_release_credit(
     )
     .bind(project_id)
     .bind(subject)
-    .bind(&p.share_kind)
+    .bind(&share_kind)
     .bind(p.amount)
     .bind(paid_at)
     .bind(note)

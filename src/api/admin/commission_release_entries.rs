@@ -9,7 +9,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::api::pagination::{Page, PageQuery, total_count};
-use crate::api::shared::require_admin;
+use crate::api::shared::{normalize_share_kind, require_admin};
 use crate::api::users::shared::E;
 
 #[derive(Serialize)]
@@ -23,8 +23,9 @@ pub struct CommissionReleaseEntryResponse {
     pub paid_at: String,
     pub created_at: i64,
     /// Scopes this entry to a specific commission component ("base"/"pool" for a
-    /// root's Baseline vs Direct buyer sections) so they can be released
-    /// independently. Null for plain-agent release entries, which have no split.
+    /// root's Baseline vs Direct buyer sections, "promo" for the Promo tab) so they
+    /// can be released independently. Null for plain-agent release entries, which
+    /// have no split.
     pub share_kind: Option<String>,
 }
 
@@ -164,6 +165,7 @@ pub async fn create_commission_release_entry(
         ));
     }
     let paid_at = parse_date(&p.paid_at, "paid_at")?;
+    let share_kind = normalize_share_kind(p.share_kind)?;
 
     let now = Utc::now().timestamp();
 
@@ -182,7 +184,7 @@ pub async fn create_commission_release_entry(
     .bind(p.amount)
     .bind(paid_at)
     .bind(now)
-    .bind(&p.share_kind)
+    .bind(&share_kind)
     .fetch_one(&pool)
     .await
     .map_err(|e| {

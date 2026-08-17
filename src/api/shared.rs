@@ -52,3 +52,22 @@ pub async fn require_admin(pool: &PgPool, headers: &HeaderMap) -> Result<(), E> 
         Err((StatusCode::FORBIDDEN, "Admin access required"))
     }
 }
+
+/// Normalizes commission release `share_kind` for entries and credits.
+/// Allowed: null/empty → None; `"base"` | `"pool"` | `"promo"`.
+pub fn normalize_share_kind(value: Option<String>) -> Result<Option<String>, E> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed {
+        "base" | "pool" | "promo" => Ok(Some(trimmed.to_string())),
+        _ => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "share_kind must be base, pool, promo, or null",
+        )),
+    }
+}

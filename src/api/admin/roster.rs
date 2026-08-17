@@ -33,6 +33,9 @@ pub struct RosterResponse {
     pub user_id: Uuid,
     pub username: String,
     pub email: String,
+    pub lastname: Option<String>,
+    pub firstname: Option<String>,
+    pub middlename: Option<String>,
     pub role: String,
     pub broker_id: Option<Uuid>,
     pub code: String,
@@ -54,8 +57,9 @@ pub struct RosterInput {
     pub status: String,
 }
 
-const ROSTER_COLUMNS: &str = "r.id, r.user_id, u.username, u.email, r.role, r.broker_id, r.code,
-                               r.prc_license_number, r.commission_rate, r.status, r.created_at, r.updated_at";
+const ROSTER_COLUMNS: &str = "r.id, r.user_id, u.username, u.email, u.lastname, u.firstname, u.middlename,
+                               r.role, r.broker_id, r.code, r.prc_license_number, r.commission_rate,
+                               r.status, r.created_at, r.updated_at";
 
 fn row_to_roster(row: sqlx::postgres::PgRow) -> RosterResponse {
     RosterResponse {
@@ -63,6 +67,9 @@ fn row_to_roster(row: sqlx::postgres::PgRow) -> RosterResponse {
         user_id: row.try_get("user_id").unwrap_or_default(),
         username: row.try_get("username").unwrap_or_default(),
         email: row.try_get("email").unwrap_or_default(),
+        lastname: row.try_get("lastname").ok().flatten(),
+        firstname: row.try_get("firstname").ok().flatten(),
+        middlename: row.try_get("middlename").ok().flatten(),
         role: row.try_get("role").unwrap_or_default(),
         broker_id: row.try_get("broker_id").ok().flatten(),
         code: row.try_get("code").unwrap_or_default(),
