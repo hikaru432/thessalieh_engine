@@ -21,6 +21,10 @@ pub struct ContractSplitHistoryResponse {
     /// takes effect from, matching the release cycle (1-15 releases the 16th; 16-30/31
     /// releases the 1st of the next month), not a whole-calendar-month granularity.
     pub effective_period_start: String,
+    /// How future commission amounts are recomputed from this change forward:
+    /// `even_split` (remaining ÷ new months) or `catch_up` (total ÷ new months, minus
+    /// paid periods, with overpayment clawback on the first new period).
+    pub rebalance_strategy: String,
     pub created_at: i64,
 }
 
@@ -31,7 +35,22 @@ fn row_to_entry(row: sqlx::postgres::PgRow) -> ContractSplitHistoryResponse {
         contract_id: row.try_get("contract_id").unwrap_or_default(),
         split_months: row.try_get("split_months").unwrap_or_default(),
         effective_period_start: effective_period_start.format("%Y-%m-%d").to_string(),
+        rebalance_strategy: row
+            .try_get("rebalance_strategy")
+            .unwrap_or_else(|_| "catch_up".to_string()),
         created_at: row.try_get("created_at").unwrap_or(0),
+    }
+}
+
+fn parse_rebalance_strategy(raw: Option<&str>) -> Result<&'static str, E> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok("even_split"),
+        Some("even_split") => Ok("even_split"),
+        Some("catch_up") => Ok("catch_up"),
+        Some(_) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "rebalance_strategy must be even_split or catch_up",
+        )),
     }
 }
 
@@ -64,7 +83,8 @@ pub async fn list_contract_split_history(
     ensure_project(&pool, project_id).await?;
 
     let rows = sqlx::query(
-        "SELECT h.id, h.contract_id, h.split_months, h.effective_period_start, h.created_at,
+        "SELECT h.id, h.contract_id, h.split_months, h.effective_period_start,
+                h.rebalance_strategy, h.created_at,
                 COUNT(*) OVER() AS total_count
            FROM public.contract_split_history h
            JOIN public.contracts c ON c.id = h.contract_id
@@ -104,6 +124,10 @@ pub struct ChangeContractSplitInput {
     /// existing single-buyer behavior (effective from "now").
     #[serde(default)]
     pub effective_period_start: Option<String>,
+    /// How future commission amounts are recomputed: `even_split` (default for new
+    /// changes) or `catch_up`. Omit to default to `even_split`.
+    #[serde(default)]
+    pub rebalance_strategy: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -129,11 +153,34 @@ fn effective_period_start_for_now() -> NaiveDate {
     NaiveDate::from_ymd_opt(now.year(), now.month(), day).unwrap_or(now)
 }
 
+/// Earliest period the bulk Commission Split picker may target — includes this
+/// month's 1-15 half even after the 16th (its release may have just happened, but
+/// admins still need to backdate a split to that boundary when re-applying).
+fn earliest_selectable_period_start() -> NaiveDate {
+    let now = Utc::now().date_naive();
+    NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap_or(now)
+}
+
 /// Same day<=15-or-16 rule as `effective_period_start_for_now`, applied to an
 /// arbitrary anchor date (used for the lazily-backfilled genesis row).
 fn period_start_containing(date: NaiveDate) -> NaiveDate {
     let day = if date.day() <= 15 { 1 } else { 16 };
     NaiveDate::from_ymd_opt(date.year(), date.month(), day).unwrap_or(date)
+}
+
+/// Prior biweek boundary — used when genesis and a change would share the same
+/// effective_period_start so history keeps two distinct rows.
+fn previous_biweek_period_start(date: NaiveDate) -> NaiveDate {
+    if date.day() == 16 {
+        NaiveDate::from_ymd_opt(date.year(), date.month(), 1).unwrap_or(date)
+    } else {
+        let (year, month) = if date.month() == 1 {
+            (date.year() - 1, 12)
+        } else {
+            (date.year(), date.month() - 1)
+        };
+        NaiveDate::from_ymd_opt(year, month, 16).unwrap_or(date)
+    }
 }
 
 /// Records a split-months change for an existing contract, effective going forward
@@ -156,6 +203,8 @@ pub async fn change_contract_split(
             "Split months must be between 1 and 120",
         ));
     }
+
+    let rebalance_strategy = parse_rebalance_strategy(p.rebalance_strategy.as_deref())?;
 
     // Joined against projects/company_id (rather than a bare contract lookup) so this
     // endpoint enforces the same tenant scoping its sibling admin endpoints already do
@@ -190,6 +239,7 @@ pub async fn change_contract_split(
     let genesis_period_start = period_start_containing(genesis_anchor);
 
     let earliest_effective = effective_period_start_for_now();
+    let earliest_selectable = earliest_selectable_period_start();
     let effective_period_start = match p.effective_period_start.as_deref() {
         Some(raw) => {
             let parsed = NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d").map_err(|_| {
@@ -204,15 +254,14 @@ pub async fn change_contract_split(
                     "effective_period_start must be the 1st or the 16th of a month",
                 ));
             }
-            if parsed < earliest_effective {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "effective_period_start cannot be earlier than the current still-unreleased period",
-                ));
-            }
             parsed
         }
         None => earliest_effective,
+    };
+    let genesis_effective = if genesis_period_start == effective_period_start {
+        previous_biweek_period_start(effective_period_start)
+    } else {
+        genesis_period_start
     };
     let now = Utc::now().timestamp();
 
@@ -235,8 +284,37 @@ pub async fn change_contract_split(
         })?
         .ok_or((StatusCode::NOT_FOUND, "Contract not found"))?;
 
-    let existing_history: Vec<(NaiveDate, i32)> = sqlx::query(
-        "SELECT effective_period_start, split_months
+    let existing_at_effective: Option<(i32, String)> = sqlx::query(
+        "SELECT split_months, rebalance_strategy
+           FROM public.contract_split_history
+          WHERE contract_id = $1 AND effective_period_start = $2",
+    )
+    .bind(contract_id)
+    .bind(effective_period_start)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to check split history")
+    })?
+    .map(|row| {
+        (
+            row.try_get("split_months").unwrap_or(current_split_months),
+            row
+                .try_get::<String, _>("rebalance_strategy")
+                .unwrap_or_else(|_| "catch_up".to_string()),
+        )
+    });
+
+    if existing_at_effective.is_none() && effective_period_start < earliest_selectable {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "effective_period_start cannot be earlier than the first selectable period this month",
+        ));
+    }
+
+    let existing_history: Vec<(NaiveDate, i32, String)> = sqlx::query(
+        "SELECT effective_period_start, split_months, rebalance_strategy
            FROM public.contract_split_history
           WHERE contract_id = $1
        ORDER BY effective_period_start ASC",
@@ -252,8 +330,10 @@ pub async fn change_contract_split(
     .map(|row| {
         (
             row.try_get::<NaiveDate, _>("effective_period_start")
-                .unwrap_or(genesis_period_start),
+                .unwrap_or(genesis_effective),
             row.try_get::<i32, _>("split_months").unwrap_or(current_split_months),
+            row.try_get::<String, _>("rebalance_strategy")
+                .unwrap_or_else(|_| "catch_up".to_string()),
         )
     })
     .collect();
@@ -268,11 +348,27 @@ pub async fn change_contract_split(
     // at a corrected effective date was rejected as a false "no change" duplicate.
     let active_before = existing_history
         .iter()
-        .filter(|(start, _)| *start <= effective_period_start)
+        .filter(|(start, _, _)| *start <= effective_period_start)
         .next_back()
-        .map(|(_, months)| *months)
+        .map(|(_, months, _)| *months)
         .unwrap_or(current_split_months);
-    if active_before == p.split_months {
+    let strategy_before = existing_at_effective
+        .as_ref()
+        .map(|(_, strategy)| strategy.as_str())
+        .or_else(|| {
+            existing_history
+                .iter()
+                .find(|(start, _, _)| *start == effective_period_start)
+                .map(|(_, _, strategy)| strategy.as_str())
+        })
+        .unwrap_or("catch_up");
+    if active_before == p.split_months && strategy_before == rebalance_strategy {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Split months and rebalance strategy are unchanged at the chosen effective date",
+        ));
+    }
+    if active_before == p.split_months && existing_at_effective.is_none() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "New split months must differ from what would be active at the chosen effective date",
@@ -282,13 +378,13 @@ pub async fn change_contract_split(
     if !has_history {
         sqlx::query(
             "INSERT INTO public.contract_split_history
-                (contract_id, split_months, effective_period_start, created_at)
-             VALUES ($1, $2, $3, $4)
+                (contract_id, split_months, effective_period_start, rebalance_strategy, created_at)
+             VALUES ($1, $2, $3, 'catch_up', $4)
              ON CONFLICT (contract_id, effective_period_start) DO NOTHING",
         )
         .bind(contract_id)
         .bind(current_split_months)
-        .bind(genesis_period_start)
+        .bind(genesis_effective)
         .bind(now)
         .execute(&mut *tx)
         .await
@@ -303,15 +399,17 @@ pub async fn change_contract_split(
 
     sqlx::query(
         "INSERT INTO public.contract_split_history
-            (contract_id, split_months, effective_period_start, created_at)
-         VALUES ($1, $2, $3, $4)
+            (contract_id, split_months, effective_period_start, rebalance_strategy, created_at)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (contract_id, effective_period_start) DO UPDATE
             SET split_months = EXCLUDED.split_months,
+                rebalance_strategy = EXCLUDED.rebalance_strategy,
                 created_at = EXCLUDED.created_at",
     )
     .bind(contract_id)
     .bind(p.split_months)
     .bind(effective_period_start)
+    .bind(rebalance_strategy)
     .bind(now)
     .execute(&mut *tx)
     .await
@@ -328,7 +426,8 @@ pub async fn change_contract_split(
     // history — see splitSegments.ts). Setting it to `p.split_months` unconditionally
     // was the bug: a FUTURE-dated change (effective_period_start > earliest_effective)
     // isn't active yet, so the column must keep showing whatever's active today until
-    // that date actually arrives.
+    // that date actually arrives. Strategy-only updates on an already-effective row
+    // leave the flat column unchanged.
     let current_active = if effective_period_start <= earliest_effective {
         p.split_months
     } else {
@@ -349,7 +448,7 @@ pub async fn change_contract_split(
     })?;
 
     let history_rows = sqlx::query(
-        "SELECT id, contract_id, split_months, effective_period_start, created_at
+        "SELECT id, contract_id, split_months, effective_period_start, rebalance_strategy, created_at
            FROM public.contract_split_history
           WHERE contract_id = $1
        ORDER BY effective_period_start ASC",

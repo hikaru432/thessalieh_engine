@@ -18,9 +18,9 @@ ALTER TABLE public.expenses DROP COLUMN IF EXISTS project_id;
 -- even be added: keep the oldest row per name, repoint every expense that pointed
 -- at a duplicate onto the surviving row, then drop the duplicates.
 WITH canonical AS (
-    SELECT name, MIN(id) AS keep_id
+    SELECT DISTINCT ON (name) name, id AS keep_id
       FROM public.expense_categories
-  GROUP BY name
+  ORDER BY name, created_at ASC, id ASC
 ),
 remap AS (
     SELECT ec.id AS old_id, c.keep_id
@@ -35,11 +35,19 @@ UPDATE public.expenses e
 
 DELETE FROM public.expense_categories ec
  USING (
-     SELECT name, MIN(id) AS keep_id
+     SELECT DISTINCT ON (name) name, id AS keep_id
        FROM public.expense_categories
-   GROUP BY name
+   ORDER BY name, created_at ASC, id ASC
  ) c
  WHERE ec.name = c.name AND ec.id <> c.keep_id;
 
-ALTER TABLE public.expense_categories ADD CONSTRAINT expense_categories_name_key UNIQUE (name);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'expense_categories_name_key'
+    ) THEN
+        ALTER TABLE public.expense_categories
+            ADD CONSTRAINT expense_categories_name_key UNIQUE (name);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS expenses_category_idx ON public.expenses (category_id);
