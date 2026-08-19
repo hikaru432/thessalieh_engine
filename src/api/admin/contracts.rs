@@ -736,13 +736,19 @@ fn row_to_cashflow_payment(row: sqlx::postgres::PgRow) -> CashFlowPaymentRespons
 
 /// Keeps the pricelist in sync with the linked contract.
 /// Reserved is only for timed holds on the pricelist (not contracts).
-async fn sync_lot_for_contract(
-    pool: &PgPool,
+/// Generic over executor (plain pool or an in-flight transaction) so callers that
+/// need this atomic with a contract insert/update can run it inside their own
+/// `tx`, while callers that don't (record_payment et al.) keep passing `&pool`.
+async fn sync_lot_for_contract<'e, Ex>(
+    executor: Ex,
     lot_id: Uuid,
     buyer_name: &str,
     payment_plan: &str,
     fully_paid: bool,
-) -> Result<(), E> {
+) -> Result<(), E>
+where
+    Ex: sqlx::PgExecutor<'e>,
+{
     let status = if fully_paid || payment_plan == "full" {
         "Sold"
     } else {
@@ -757,7 +763,7 @@ async fn sync_lot_for_contract(
     .bind(buyer_name)
     .bind(status)
     .bind(lot_id)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(|e| {
         tracing::error!("DB: {e}");
@@ -766,7 +772,10 @@ async fn sync_lot_for_contract(
     Ok(())
 }
 
-async fn clear_lot(pool: &PgPool, lot_id: Uuid) -> Result<(), E> {
+async fn clear_lot<'e, Ex>(executor: Ex, lot_id: Uuid) -> Result<(), E>
+where
+    Ex: sqlx::PgExecutor<'e>,
+{
     sqlx::query(
         "UPDATE public.lots
             SET owner_buyer = NULL, on_hold = false, status = 'Available', reserved_until = NULL,
@@ -774,7 +783,7 @@ async fn clear_lot(pool: &PgPool, lot_id: Uuid) -> Result<(), E> {
           WHERE id = $1",
     )
     .bind(lot_id)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(|e| {
         tracing::error!("DB: {e}");
@@ -1060,6 +1069,48 @@ pub async fn create_contract(
         ));
     }
 
+    // Everything below (contract insert, opening-payment insert, lot sync) runs in
+    // one transaction: previously each was a separate statement against `&pool`, so
+    // a failure partway through (e.g. the opening-payment insert) still left the
+    // contract committed but returned an error — and the frontend's cart retries a
+    // failed lot by calling this endpoint again, which would create a second,
+    // duplicate contract for the same buyer/lot on top of the orphaned first one.
+    let mut tx = pool.begin().await.map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start transaction")
+    })?;
+
+    if let Some(lot_id) = p.lot_id {
+        // Lock the lot row first so two concurrent creates targeting the same lot
+        // serialize instead of both reading "not yet sold" and both inserting.
+        sqlx::query("SELECT id FROM public.lots WHERE id = $1 FOR UPDATE")
+            .bind(lot_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to verify lot availability")
+            })?;
+        let already_sold: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM public.contracts WHERE lot_id = $1)")
+                .bind(lot_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| {
+                    tracing::error!("DB: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to verify lot availability",
+                    )
+                })?;
+        if already_sold {
+            return Err((
+                StatusCode::CONFLICT,
+                "This lot already has a contract — pick a different lot, or edit the existing contract instead",
+            ));
+        }
+    }
+
     let row = sqlx::query(
         "INSERT INTO public.contracts (
              project_id, lot_id, buyer_user_id, buyer_name, buyer_last_name, buyer_first_name, buyer_middle_name,
@@ -1112,7 +1163,7 @@ pub async fn create_contract(
     .bind(p.agent_commission_split_months)
     .bind(now)
     .bind(now)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_contract_db_error("Failed to create contract"))?;
 
@@ -1152,7 +1203,7 @@ pub async fn create_contract(
         .bind(&sender_name)
         .bind(&receiver_name)
         .bind(&mode_label)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("DB: {e}");
@@ -1162,7 +1213,7 @@ pub async fn create_contract(
 
     if let Some(lot_id) = p.lot_id {
         sync_lot_for_contract(
-            &pool,
+            &mut *tx,
             lot_id,
             &buyer_name,
             &p.payment_plan,
@@ -1170,6 +1221,11 @@ pub async fn create_contract(
         )
         .await?;
     }
+
+    tx.commit().await.map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save contract")
+    })?;
 
     get_contract(Extension(pool), headers, Path(contract_id))
         .await
@@ -1191,9 +1247,18 @@ pub async fn update_contract(
     validate_buyer_user(&pool, buyer_user_id).await?;
     let names = resolve_buyer_names(&p)?;
 
+    // Wraps the whole update (including the lot reassignment below) in one
+    // transaction — same reasoning as create_contract: reassigning a contract onto
+    // a lot that already belongs to a different contract must be rejected, and the
+    // rejection must happen before the contract row itself is changed, not after.
+    let mut tx = pool.begin().await.map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start transaction")
+    })?;
+
     let previous_row = sqlx::query("SELECT lot_id, agent_commission_split_months FROM public.contracts WHERE id = $1")
         .bind(id)
-        .fetch_optional(&pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("DB: {e}");
@@ -1201,6 +1266,39 @@ pub async fn update_contract(
         })?
         .ok_or((StatusCode::NOT_FOUND, "Contract not found"))?;
     let previous_lot_id: Option<Uuid> = previous_row.try_get("lot_id").ok().flatten();
+
+    if let Some(new_lot_id) = p.lot_id
+        && Some(new_lot_id) != previous_lot_id
+    {
+        sqlx::query("SELECT id FROM public.lots WHERE id = $1 FOR UPDATE")
+            .bind(new_lot_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to verify lot availability")
+            })?;
+        let already_sold: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM public.contracts WHERE lot_id = $1 AND id != $2)",
+        )
+        .bind(new_lot_id)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!("DB: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to verify lot availability",
+            )
+        })?;
+        if already_sold {
+            return Err((
+                StatusCode::CONFLICT,
+                "This lot already has a contract — pick a different lot, or edit the existing contract instead",
+            ));
+        }
+    }
     // The general edit form can no longer change the split — it must go through the
     // dedicated /contracts/{id}/split-change endpoint (contract_split_history.rs) so
     // a change is recorded with an effective date instead of silently overwriting the
@@ -1234,7 +1332,7 @@ pub async fn update_contract(
         "SELECT amount, paid_at, months_covered FROM public.payments WHERE contract_id = $1",
     )
     .bind(id)
-    .fetch_all(&pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| {
         tracing::error!("DB: {e}");
@@ -1329,7 +1427,7 @@ pub async fn update_contract(
             .bind(p.agent_commission_split_months)
             .bind(now)
             .bind(id)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
         }
         ResolvedBuyerNames::Legacy { buyer_name } => {
@@ -1378,7 +1476,7 @@ pub async fn update_contract(
             .bind(p.agent_commission_split_months)
             .bind(now)
             .bind(id)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
         }
     }
@@ -1391,14 +1489,14 @@ pub async fn update_contract(
     if previous_lot_id != p.lot_id
         && let Some(old_lot_id) = previous_lot_id
     {
-        clear_lot(&pool, old_lot_id).await?;
+        clear_lot(&mut *tx, old_lot_id).await?;
     }
     if let Some(lot_id) = p.lot_id {
         let total_paid: f64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(amount), 0) FROM public.payments WHERE contract_id = $1",
         )
         .bind(id)
-        .fetch_one(&pool)
+        .fetch_one(&mut *tx)
         .await
         .unwrap_or(0.0);
         let paid = if total_paid > 0.0 {
@@ -1407,7 +1505,7 @@ pub async fn update_contract(
             p.initial_payment
         };
         sync_lot_for_contract(
-            &pool,
+            &mut *tx,
             lot_id,
             &buyer_name_for_sync,
             &p.payment_plan,
@@ -1415,6 +1513,11 @@ pub async fn update_contract(
         )
         .await?;
     }
+
+    tx.commit().await.map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save contract")
+    })?;
 
     get_contract(Extension(pool), headers, Path(id))
         .await
@@ -2002,10 +2105,15 @@ pub async fn delete_contract(
 ) -> Result<StatusCode, E> {
     require_admin(&pool, &headers).await?;
 
+    let mut tx = pool.begin().await.map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start transaction")
+    })?;
+
     let lot_id: Option<Uuid> =
         sqlx::query_scalar("SELECT lot_id FROM public.contracts WHERE id = $1")
             .bind(id)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| {
                 tracing::error!("DB: {e}");
@@ -2015,7 +2123,7 @@ pub async fn delete_contract(
 
     let result = sqlx::query("DELETE FROM public.contracts WHERE id = $1")
         .bind(id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("DB: {e}");
@@ -2027,12 +2135,12 @@ pub async fn delete_contract(
     }
 
     if let Some(lot_id) = lot_id {
-        clear_lot(&pool, lot_id).await?;
+        clear_lot(&mut *tx, lot_id).await?;
     }
 
     sqlx::query("DELETE FROM public.commission_row_meta WHERE row_key = $1")
         .bind(id.to_string())
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("DB: {e}");
@@ -2041,6 +2149,11 @@ pub async fn delete_contract(
                 "Failed to clean up commission row meta",
             )
         })?;
+
+    tx.commit().await.map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to delete contract")
+    })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
