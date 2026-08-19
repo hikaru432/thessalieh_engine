@@ -82,6 +82,10 @@ pub fn routes() -> Router {
             get(leadbroker::list_commission_status),
         )
         .route(
+            "/me/lb/projects/{project_id}/contract-split-history",
+            get(leadbroker::list_contract_split_history),
+        )
+        .route(
             "/me/lb/projects/{project_id}/commission-release-entries",
             get(leadbroker::list_commission_release_entries),
         )
@@ -110,6 +114,10 @@ pub fn routes() -> Router {
         .route(
             "/me/to/projects/{project_id}/commission-status",
             get(titlingofficer::list_commission_status),
+        )
+        .route(
+            "/me/to/projects/{project_id}/contract-split-history",
+            get(titlingofficer::list_contract_split_history),
         )
         .route(
             "/me/to/projects/{project_id}/commission-release-entries",
@@ -145,6 +153,10 @@ pub fn routes() -> Router {
             get(upline_portal::list_commission_status),
         )
         .route(
+            "/me/upline/{role_slug}/projects/{project_id}/contract-split-history",
+            get(upline_portal::list_contract_split_history),
+        )
+        .route(
             "/me/upline/{role_slug}/projects/{project_id}/commission-release-entries",
             get(upline_portal::list_commission_release_entries),
         )
@@ -172,6 +184,10 @@ pub fn routes() -> Router {
         .route(
             "/me/agent/projects/{project_id}/commission-status",
             get(agent::list_commission_status),
+        )
+        .route(
+            "/me/agent/projects/{project_id}/contract-split-history",
+            get(agent::list_contract_split_history),
         )
         .route(
             "/me/agent/projects/{project_id}/commission-release-entries",

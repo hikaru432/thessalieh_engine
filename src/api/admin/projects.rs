@@ -55,6 +55,16 @@ fn row_to_project(row: sqlx::postgres::PgRow) -> ProjectResponse {
     }
 }
 
+/// Beyond the documented id/name/role contract, this also rejects agent ids
+/// duplicated within the same project (an ambiguous identity that confuses the
+/// downline-tree walk in `leadbroker::agents::collect_direct_and_downline_seller_ids`)
+/// and an out-of-range `sharePercent` when present — every other percent field in
+/// this codebase (commission_rates, project_rate_config, upline_role_types) is
+/// bounded 0-100 the same way; this was the one carrying real split percentages
+/// that wasn't. `sharePercent` stays optional here (not every agents_json entry
+/// carries one, e.g. root LB/TO entries), so only its value is validated, not its
+/// presence — the frontend's own math is unaffected by this, it just can no longer
+/// be handed a value that was never legal in the first place.
 fn validate_agents_json(agents: &Value) -> Result<(), E> {
     let Some(items) = agents.as_array() else {
         return Err((
@@ -62,6 +72,7 @@ fn validate_agents_json(agents: &Value) -> Result<(), E> {
             "agents must be a JSON array",
         ));
     };
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for item in items {
         let Some(obj) = item.as_object() else {
             return Err((
@@ -69,14 +80,34 @@ fn validate_agents_json(agents: &Value) -> Result<(), E> {
                 "Each agent must be an object",
             ));
         };
-        if !obj.get("id").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+        let Some(id) = obj.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
             return Err((StatusCode::UNPROCESSABLE_ENTITY, "Agent id is required"));
+        };
+        if !seen_ids.insert(id) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Duplicate agent id in agents list",
+            ));
         }
         if !obj.get("name").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
             return Err((StatusCode::UNPROCESSABLE_ENTITY, "Agent name is required"));
         }
         if !obj.get("role").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
             return Err((StatusCode::UNPROCESSABLE_ENTITY, "Agent role is required"));
+        }
+        if let Some(share) = obj.get("sharePercent")
+            && !share.is_null()
+        {
+            let value = share.as_f64().ok_or((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Agent sharePercent must be a number",
+            ))?;
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Agent sharePercent must be between 0 and 100",
+                ));
+            }
         }
     }
     Ok(())

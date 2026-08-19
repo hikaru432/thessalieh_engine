@@ -409,6 +409,15 @@ fn expected_installment_amount(
 /// paid off, or no monthly schedule). Computed fresh from the whole payment
 /// history every time, so a late-but-same-month payment correctly advances
 /// the due date and any prior drift self-heals instead of compounding.
+///
+/// Mirrors the frontend's `walkPaymentAllocations` (trackingHelpers.ts) slot-by-slot
+/// FIFO walk: a payment that doesn't fully clear the slot it lands on leaves the
+/// cursor sitting there (unless this was a mid-multi-month payment, which must still
+/// advance one slot per covered month) so the NEXT payment keeps topping up that same
+/// slot instead of being misapplied to whatever comes after it — otherwise two
+/// half-payments for one installment (e.g. an intentional "pay half now, half later")
+/// land on two different slots and both stay stuck at "unpaid" forever, even once the
+/// buyer has genuinely paid a full month's worth between them.
 fn compute_next_unpaid_due_date(
     anchor: NaiveDate,
     due_day: i32,
@@ -424,7 +433,7 @@ fn compute_next_unpaid_due_date(
         return None;
     }
 
-    let mut paid = vec![false; schedule.len()];
+    let mut paid_for_slot = vec![0.0_f64; schedule.len()];
     let mut recurring: Vec<&(f64, NaiveDate, i32)> = payments
         .iter()
         .filter(|(amount, paid_at, _)| {
@@ -441,19 +450,27 @@ fn compute_next_unpaid_due_date(
             (*months_covered).max(1) as usize
         };
         let per_installment = amount / covers as f64;
-        for _ in 0..covers {
-            if cursor >= paid.len() {
+        for i in 0..covers {
+            if cursor >= paid_for_slot.len() {
                 break;
             }
             let expected = expected_installment_amount(cursor, monthly_amort, first_installment_amount);
-            if is_paid_amount(per_installment, expected) {
-                paid[cursor] = true;
+            paid_for_slot[cursor] += per_installment;
+            let is_last_slice_of_payment = i == covers - 1;
+            let still_open = !is_paid_amount(paid_for_slot[cursor], expected);
+            if !is_last_slice_of_payment || !still_open {
+                cursor += 1;
             }
-            cursor += 1;
         }
     }
 
-    paid.iter().position(|p| !p).map(|idx| schedule[idx])
+    for (idx, slot_total) in paid_for_slot.iter().enumerate() {
+        let expected = expected_installment_amount(idx, monthly_amort, first_installment_amount);
+        if !is_paid_amount(*slot_total, expected) {
+            return Some(schedule[idx]);
+        }
+    }
+    None
 }
 
 fn format_buyer_name(last: &str, first: &str, middle: &str) -> String {

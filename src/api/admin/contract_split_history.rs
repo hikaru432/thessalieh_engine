@@ -28,7 +28,7 @@ pub struct ContractSplitHistoryResponse {
     pub created_at: i64,
 }
 
-fn row_to_entry(row: sqlx::postgres::PgRow) -> ContractSplitHistoryResponse {
+pub(crate) fn row_to_entry(row: sqlx::postgres::PgRow) -> ContractSplitHistoryResponse {
     let effective_period_start: NaiveDate = row.try_get("effective_period_start").unwrap_or_default();
     ContractSplitHistoryResponse {
         id: row.try_get("id").unwrap_or_default(),

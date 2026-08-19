@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query},
     http::{HeaderMap, StatusCode},
 };
-use chrono::{NaiveDate, Utc};
+use chrono::{Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -56,6 +56,45 @@ fn parse_date(value: &str, field: &'static str) -> Result<NaiveDate, E> {
 
 fn format_date(d: NaiveDate) -> String {
     d.format("%Y-%m-%d").to_string()
+}
+
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    NaiveDate::from_ymd_opt(ny, nm, 1)
+        .unwrap()
+        .pred_opt()
+        .unwrap()
+        .day()
+}
+
+/// This system's release cadence has exactly two periods per calendar month: 1-15
+/// and 16-(28/29/30/31) — same convention `change_contract_split` already enforces
+/// on `effective_period_start` (see contract_split_history.rs). A release entry
+/// whose period doesn't land on that boundary (e.g. a typo'd start date) would
+/// silently fail to match the frontend's period-keyed lookup, recording money as
+/// released while leaving it invisible in the waterfall — this rejects that at
+/// write time instead of letting it become an orphaned row.
+fn validate_period_boundary(period_start: NaiveDate, period_end: NaiveDate) -> Result<(), E> {
+    let expected_end_day = match period_start.day() {
+        1 => 15,
+        16 => last_day_of_month(period_start.year(), period_start.month()),
+        _ => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "period_start must be the 1st or the 16th of a month",
+            ));
+        }
+    };
+    let expected_end =
+        NaiveDate::from_ymd_opt(period_start.year(), period_start.month(), expected_end_day)
+            .unwrap_or(period_start);
+    if period_end != expected_end {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "period_end must match the biweekly period implied by period_start (15th, or the last day of the month)",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn row_to_entry(row: sqlx::postgres::PgRow) -> CommissionReleaseEntryResponse {
@@ -164,6 +203,7 @@ pub async fn create_commission_release_entry(
             "period_end must be on or after period_start",
         ));
     }
+    validate_period_boundary(period_start, period_end)?;
     let paid_at = parse_date(&p.paid_at, "paid_at")?;
     let share_kind = normalize_share_kind(p.share_kind)?;
 
