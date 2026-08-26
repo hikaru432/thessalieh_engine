@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::api::admin::upline_role_types::validate_direct_sale_pool_percent;
 use crate::api::shared::require_admin;
 use crate::api::users::shared::E;
 
@@ -106,7 +107,8 @@ pub async fn fetch_project_rate_config(
     let upline_rows = sqlx::query(
         "SELECT u.slug, u.label,
                 COALESCE(r.percent, u.base_commission_percent) AS percent,
-                u.has_baseline, u.direct_sale_pool_percent
+                COALESCE(r.has_baseline, u.has_baseline) AS has_baseline,
+                COALESCE(r.direct_sale_pool_percent, u.direct_sale_pool_percent) AS direct_sale_pool_percent
            FROM public.upline_role_types u
       LEFT JOIN public.project_upline_role_rates r
              ON r.project_id = $1 AND r.upline_role_type_slug = u.slug
@@ -374,10 +376,12 @@ pub async fn delete_rate_category(
 #[derive(Deserialize)]
 pub struct UpdateUplineRoleRateInput {
     pub percent: f64,
+    pub has_baseline: bool,
+    pub direct_sale_pool_percent: Option<f64>,
 }
 
 /// PATCH /projects/{project_id}/rate-config/upline-roles/{slug} — admin only. Upserts
-/// this project's percent for an existing (globally-defined) upline role.
+/// this project's percent and commission-behavior flags for an existing upline role.
 pub async fn update_upline_role_rate(
     Extension(pool): Extension<PgPool>,
     headers: HeaderMap,
@@ -387,9 +391,10 @@ pub async fn update_upline_role_rate(
     require_admin(&pool, &headers).await?;
     ensure_project(&pool, project_id).await?;
     validate_percent(p.percent)?;
+    validate_direct_sale_pool_percent(p.direct_sale_pool_percent)?;
 
     let role_row = sqlx::query(
-        "SELECT label, has_baseline, direct_sale_pool_percent FROM public.upline_role_types WHERE slug = $1",
+        "SELECT label FROM public.upline_role_types WHERE slug = $1",
     )
     .bind(&slug)
     .fetch_optional(&pool)
@@ -400,9 +405,6 @@ pub async fn update_upline_role_rate(
     })?
     .ok_or((StatusCode::NOT_FOUND, "Upline role not found"))?;
     let label: String = role_row.try_get("label").unwrap_or_default();
-    let has_baseline: bool = role_row.try_get("has_baseline").unwrap_or(true);
-    let direct_sale_pool_percent: Option<f64> =
-        role_row.try_get("direct_sale_pool_percent").ok().flatten();
 
     // The upline roles' percents are carved out of the project's agent-pool category —
     // reject a value that would push their total over that bucket instead of silently
@@ -443,14 +445,20 @@ pub async fn update_upline_role_rate(
 
     sqlx::query(
         "INSERT INTO public.project_upline_role_rates
-             (project_id, upline_role_type_slug, percent, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $4)
+             (project_id, upline_role_type_slug, percent, has_baseline,
+              direct_sale_pool_percent, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $6)
          ON CONFLICT (project_id, upline_role_type_slug) DO UPDATE
-            SET percent = EXCLUDED.percent, updated_at = EXCLUDED.updated_at",
+            SET percent = EXCLUDED.percent,
+                has_baseline = EXCLUDED.has_baseline,
+                direct_sale_pool_percent = EXCLUDED.direct_sale_pool_percent,
+                updated_at = EXCLUDED.updated_at",
     )
     .bind(project_id)
     .bind(&slug)
     .bind(p.percent)
+    .bind(p.has_baseline)
+    .bind(p.direct_sale_pool_percent)
     .bind(now)
     .execute(&pool)
     .await
@@ -466,8 +474,8 @@ pub async fn update_upline_role_rate(
         slug,
         label,
         percent: p.percent,
-        has_baseline,
-        direct_sale_pool_percent,
+        has_baseline: p.has_baseline,
+        direct_sale_pool_percent: p.direct_sale_pool_percent,
     }))
 }
 
@@ -544,25 +552,34 @@ pub async fn seed_project_rate_config(
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to seed rate config")
     })?;
 
-    let role_rows = sqlx::query("SELECT slug, base_commission_percent FROM public.upline_role_types")
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|e| {
-            tracing::error!("DB: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to seed rate config")
-        })?;
+    let role_rows = sqlx::query(
+        "SELECT slug, base_commission_percent, has_baseline, direct_sale_pool_percent
+           FROM public.upline_role_types",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to seed rate config")
+    })?;
 
     for row in role_rows {
         let slug: String = row.try_get("slug").unwrap_or_default();
         let percent: f64 = row.try_get("base_commission_percent").unwrap_or(0.0);
+        let has_baseline: bool = row.try_get("has_baseline").unwrap_or(true);
+        let direct_sale_pool_percent: Option<f64> =
+            row.try_get("direct_sale_pool_percent").ok().flatten();
         sqlx::query(
             "INSERT INTO public.project_upline_role_rates
-                 (project_id, upline_role_type_slug, percent, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $4)",
+                 (project_id, upline_role_type_slug, percent, has_baseline,
+                  direct_sale_pool_percent, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $6)",
         )
         .bind(project_id)
         .bind(&slug)
         .bind(percent)
+        .bind(has_baseline)
+        .bind(direct_sale_pool_percent)
         .bind(now)
         .execute(&mut **tx)
         .await

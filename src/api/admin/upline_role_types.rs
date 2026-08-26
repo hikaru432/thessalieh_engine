@@ -130,7 +130,7 @@ pub async fn list_upline_role_types(
     Ok(Json(rows.into_iter().map(row_to_role_type).collect()))
 }
 
-fn validate_direct_sale_pool_percent(value: Option<f64>) -> Result<(), E> {
+pub fn validate_direct_sale_pool_percent(value: Option<f64>) -> Result<(), E> {
     match value {
         Some(v) if !v.is_finite() || v < 0.0 || v > 100.0 => Err((
             StatusCode::UNPROCESSABLE_ENTITY,
