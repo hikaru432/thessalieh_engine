@@ -470,12 +470,34 @@ pub async fn update_upline_role_rate(
         )
     })?;
 
+    let saved = sqlx::query(
+        "SELECT u.slug, u.label,
+                COALESCE(r.percent, u.base_commission_percent) AS percent,
+                COALESCE(r.has_baseline, u.has_baseline) AS has_baseline,
+                COALESCE(r.direct_sale_pool_percent, u.direct_sale_pool_percent) AS direct_sale_pool_percent
+           FROM public.upline_role_types u
+      LEFT JOIN public.project_upline_role_rates r
+             ON r.project_id = $1 AND r.upline_role_type_slug = u.slug
+          WHERE u.slug = $2",
+    )
+    .bind(project_id)
+    .bind(&slug)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("DB: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load saved upline role rate",
+        )
+    })?;
+
     Ok(Json(UplineRoleRateResponse {
-        slug,
-        label,
-        percent: p.percent,
-        has_baseline: p.has_baseline,
-        direct_sale_pool_percent: p.direct_sale_pool_percent,
+        slug: saved.try_get("slug").unwrap_or(slug),
+        label: saved.try_get("label").unwrap_or(label),
+        percent: saved.try_get("percent").unwrap_or(p.percent),
+        has_baseline: saved.try_get("has_baseline").unwrap_or(p.has_baseline),
+        direct_sale_pool_percent: saved.try_get("direct_sale_pool_percent").ok().flatten(),
     }))
 }
 

@@ -566,6 +566,26 @@ fn validate_contract_input(p: &ContractInput) -> Result<(), E> {
             "Agent commission split months must be between 1 and 120",
         ));
     }
+    if p.payment_plan == "full" {
+        if p.term_years != 0 || p.term_months != 0 {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Full payment contracts must not carry an installment term",
+            ));
+        }
+        if p.monthly_amortization != 0.0 {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Full payment contracts must not have monthly amortization",
+            ));
+        }
+        if p.first_installment_amount.is_some() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Full payment contracts cannot set a custom first installment",
+            ));
+        }
+    }
     if let Some(amt) = p.first_installment_amount {
         if amt <= 0.0 {
             return Err((
