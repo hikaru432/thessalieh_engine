@@ -25,6 +25,10 @@ pub struct ContractSplitHistoryResponse {
     /// `even_split` (remaining ÷ new months) or `catch_up` (total ÷ new months, minus
     /// paid periods, with overpayment clawback on the first new period).
     pub rebalance_strategy: String,
+    /// When a catch-up installment is paid in a biweek on a newer split: adopt that
+    /// split's rate (`adopt_new_split`) or keep the due-period genesis rate
+    /// (`keep_due_period_split`).
+    pub late_payment_split_mode: String,
     pub created_at: i64,
 }
 
@@ -38,6 +42,9 @@ pub(crate) fn row_to_entry(row: sqlx::postgres::PgRow) -> ContractSplitHistoryRe
         rebalance_strategy: row
             .try_get("rebalance_strategy")
             .unwrap_or_else(|_| "catch_up".to_string()),
+        late_payment_split_mode: row
+            .try_get("late_payment_split_mode")
+            .unwrap_or_else(|_| "keep_due_period_split".to_string()),
         created_at: row.try_get("created_at").unwrap_or(0),
     }
 }
@@ -50,6 +57,18 @@ fn parse_rebalance_strategy(raw: Option<&str>) -> Result<&'static str, E> {
         Some(_) => Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "rebalance_strategy must be even_split or catch_up",
+        )),
+    }
+}
+
+fn parse_late_payment_split_mode(raw: Option<&str>) -> Result<&'static str, E> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok("adopt_new_split"),
+        Some("adopt_new_split") => Ok("adopt_new_split"),
+        Some("keep_due_period_split") => Ok("keep_due_period_split"),
+        Some(_) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "late_payment_split_mode must be adopt_new_split or keep_due_period_split",
         )),
     }
 }
@@ -84,7 +103,7 @@ pub async fn list_contract_split_history(
 
     let rows = sqlx::query(
         "SELECT h.id, h.contract_id, h.split_months, h.effective_period_start,
-                h.rebalance_strategy, h.created_at,
+                h.rebalance_strategy, h.late_payment_split_mode, h.created_at,
                 COUNT(*) OVER() AS total_count
            FROM public.contract_split_history h
            JOIN public.contracts c ON c.id = h.contract_id
@@ -128,6 +147,9 @@ pub struct ChangeContractSplitInput {
     /// changes) or `catch_up`. Omit to default to `even_split`.
     #[serde(default)]
     pub rebalance_strategy: Option<String>,
+    /// Catch-up paid under a newer split: adopt that rate (default) or keep due-period rate.
+    #[serde(default)]
+    pub late_payment_split_mode: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -205,6 +227,7 @@ pub async fn change_contract_split(
     }
 
     let rebalance_strategy = parse_rebalance_strategy(p.rebalance_strategy.as_deref())?;
+    let late_payment_split_mode = parse_late_payment_split_mode(p.late_payment_split_mode.as_deref())?;
 
     // Joined against projects/company_id (rather than a bare contract lookup) so this
     // endpoint enforces the same tenant scoping its sibling admin endpoints already do
@@ -284,8 +307,8 @@ pub async fn change_contract_split(
         })?
         .ok_or((StatusCode::NOT_FOUND, "Contract not found"))?;
 
-    let existing_at_effective: Option<(i32, String)> = sqlx::query(
-        "SELECT split_months, rebalance_strategy
+    let existing_at_effective: Option<(i32, String, String)> = sqlx::query(
+        "SELECT split_months, rebalance_strategy, late_payment_split_mode
            FROM public.contract_split_history
           WHERE contract_id = $1 AND effective_period_start = $2",
     )
@@ -303,6 +326,8 @@ pub async fn change_contract_split(
             row
                 .try_get::<String, _>("rebalance_strategy")
                 .unwrap_or_else(|_| "catch_up".to_string()),
+            row.try_get::<String, _>("late_payment_split_mode")
+                .unwrap_or_else(|_| "keep_due_period_split".to_string()),
         )
     });
 
@@ -313,8 +338,8 @@ pub async fn change_contract_split(
         ));
     }
 
-    let existing_history: Vec<(NaiveDate, i32, String)> = sqlx::query(
-        "SELECT effective_period_start, split_months, rebalance_strategy
+    let existing_history: Vec<(NaiveDate, i32, String, String)> = sqlx::query(
+        "SELECT effective_period_start, split_months, rebalance_strategy, late_payment_split_mode
            FROM public.contract_split_history
           WHERE contract_id = $1
        ORDER BY effective_period_start ASC",
@@ -334,6 +359,8 @@ pub async fn change_contract_split(
             row.try_get::<i32, _>("split_months").unwrap_or(current_split_months),
             row.try_get::<String, _>("rebalance_strategy")
                 .unwrap_or_else(|_| "catch_up".to_string()),
+            row.try_get::<String, _>("late_payment_split_mode")
+                .unwrap_or_else(|_| "keep_due_period_split".to_string()),
         )
     })
     .collect();
@@ -348,24 +375,37 @@ pub async fn change_contract_split(
     // at a corrected effective date was rejected as a false "no change" duplicate.
     let active_before = existing_history
         .iter()
-        .filter(|(start, _, _)| *start <= effective_period_start)
+        .filter(|(start, _, _, _)| *start <= effective_period_start)
         .next_back()
-        .map(|(_, months, _)| *months)
+        .map(|(_, months, _, _)| *months)
         .unwrap_or(current_split_months);
     let strategy_before = existing_at_effective
         .as_ref()
-        .map(|(_, strategy)| strategy.as_str())
+        .map(|(_, strategy, _)| strategy.as_str())
         .or_else(|| {
             existing_history
                 .iter()
-                .find(|(start, _, _)| *start == effective_period_start)
-                .map(|(_, _, strategy)| strategy.as_str())
+                .find(|(start, _, _, _)| *start == effective_period_start)
+                .map(|(_, _, strategy, _)| strategy.as_str())
         })
         .unwrap_or("catch_up");
-    if active_before == p.split_months && strategy_before == rebalance_strategy {
+    let mode_before = existing_at_effective
+        .as_ref()
+        .map(|(_, _, mode)| mode.as_str())
+        .or_else(|| {
+            existing_history
+                .iter()
+                .find(|(start, _, _, _)| *start == effective_period_start)
+                .map(|(_, _, _, mode)| mode.as_str())
+        })
+        .unwrap_or("keep_due_period_split");
+    if active_before == p.split_months
+        && strategy_before == rebalance_strategy
+        && mode_before == late_payment_split_mode
+    {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            "Split months and rebalance strategy are unchanged at the chosen effective date",
+            "Split months, rebalance strategy, and late payment split mode are unchanged at the chosen effective date",
         ));
     }
     if active_before == p.split_months && existing_at_effective.is_none() {
@@ -378,8 +418,9 @@ pub async fn change_contract_split(
     if !has_history {
         sqlx::query(
             "INSERT INTO public.contract_split_history
-                (contract_id, split_months, effective_period_start, rebalance_strategy, created_at)
-             VALUES ($1, $2, $3, 'catch_up', $4)
+                (contract_id, split_months, effective_period_start, rebalance_strategy,
+                 late_payment_split_mode, created_at)
+             VALUES ($1, $2, $3, 'catch_up', 'keep_due_period_split', $4)
              ON CONFLICT (contract_id, effective_period_start) DO NOTHING",
         )
         .bind(contract_id)
@@ -399,17 +440,20 @@ pub async fn change_contract_split(
 
     sqlx::query(
         "INSERT INTO public.contract_split_history
-            (contract_id, split_months, effective_period_start, rebalance_strategy, created_at)
-         VALUES ($1, $2, $3, $4, $5)
+            (contract_id, split_months, effective_period_start, rebalance_strategy,
+             late_payment_split_mode, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (contract_id, effective_period_start) DO UPDATE
             SET split_months = EXCLUDED.split_months,
                 rebalance_strategy = EXCLUDED.rebalance_strategy,
+                late_payment_split_mode = EXCLUDED.late_payment_split_mode,
                 created_at = EXCLUDED.created_at",
     )
     .bind(contract_id)
     .bind(p.split_months)
     .bind(effective_period_start)
     .bind(rebalance_strategy)
+    .bind(late_payment_split_mode)
     .bind(now)
     .execute(&mut *tx)
     .await
@@ -448,7 +492,8 @@ pub async fn change_contract_split(
     })?;
 
     let history_rows = sqlx::query(
-        "SELECT id, contract_id, split_months, effective_period_start, rebalance_strategy, created_at
+        "SELECT id, contract_id, split_months, effective_period_start, rebalance_strategy,
+                late_payment_split_mode, created_at
            FROM public.contract_split_history
           WHERE contract_id = $1
        ORDER BY effective_period_start ASC",

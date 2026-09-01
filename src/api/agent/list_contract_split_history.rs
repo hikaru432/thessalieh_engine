@@ -31,7 +31,7 @@ pub async fn list_contract_split_history(
 
     let rows = sqlx::query(
         "SELECT h.id, h.contract_id, h.split_months, h.effective_period_start,
-                h.rebalance_strategy, h.created_at,
+                h.rebalance_strategy, h.late_payment_split_mode, h.created_at,
                 COUNT(*) OVER() AS total_count
            FROM public.contract_split_history h
            JOIN public.contracts c ON c.id = h.contract_id
