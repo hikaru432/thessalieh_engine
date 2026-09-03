@@ -26,7 +26,7 @@ pub async fn list_commission_release_entries(
 
     let rows = sqlx::query(
         "SELECT id, project_id, subject_agent_id, period_start, period_end,
-                amount, paid_at, created_at, share_kind, COUNT(*) OVER() AS total_count
+                amount, paid_at, created_at, share_kind, row_key, buyer_label, note, COUNT(*) OVER() AS total_count
            FROM public.commission_release_entries
           WHERE project_id = $1
             AND subject_agent_id = $2

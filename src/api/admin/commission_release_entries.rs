@@ -27,6 +27,11 @@ pub struct CommissionReleaseEntryResponse {
     /// can be released independently. Null for plain-agent release entries, which
     /// have no split.
     pub share_kind: Option<String>,
+    /// Contract id this release was recorded against from a buyer cell. Null for
+    /// period-level footer / modal releases.
+    pub row_key: Option<String>,
+    pub buyer_label: Option<String>,
+    pub note: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -38,6 +43,12 @@ pub struct CreateCommissionReleaseEntryInput {
     pub paid_at: String,
     #[serde(default)]
     pub share_kind: Option<String>,
+    #[serde(default)]
+    pub row_key: Option<String>,
+    #[serde(default)]
+    pub buyer_label: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 fn parse_date(value: &str, field: &'static str) -> Result<NaiveDate, E> {
@@ -56,6 +67,17 @@ fn parse_date(value: &str, field: &'static str) -> Result<NaiveDate, E> {
 
 fn format_date(d: NaiveDate) -> String {
     d.format("%Y-%m-%d").to_string()
+}
+
+fn optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn last_day_of_month(year: i32, month: u32) -> u32 {
@@ -111,6 +133,9 @@ pub(crate) fn row_to_entry(row: sqlx::postgres::PgRow) -> CommissionReleaseEntry
         paid_at: format_date(paid_at),
         created_at: row.try_get("created_at").unwrap_or(0),
         share_kind: row.try_get("share_kind").unwrap_or_default(),
+        row_key: row.try_get("row_key").unwrap_or(None),
+        buyer_label: row.try_get("buyer_label").unwrap_or(None),
+        note: row.try_get("note").unwrap_or(None),
     }
 }
 
@@ -145,7 +170,8 @@ pub async fn list_commission_release_entries(
 
     let rows = sqlx::query(
         "SELECT id, project_id, subject_agent_id, period_start, period_end,
-                amount, paid_at, created_at, share_kind, COUNT(*) OVER() AS total_count
+                amount, paid_at, created_at, share_kind, row_key, buyer_label, note,
+                COUNT(*) OVER() AS total_count
            FROM public.commission_release_entries
           WHERE project_id = $1
        ORDER BY period_start ASC, subject_agent_id ASC, paid_at ASC
@@ -206,16 +232,19 @@ pub async fn create_commission_release_entry(
     validate_period_boundary(period_start, period_end)?;
     let paid_at = parse_date(&p.paid_at, "paid_at")?;
     let share_kind = normalize_share_kind(p.share_kind)?;
+    let row_key = optional_text(p.row_key);
+    let buyer_label = optional_text(p.buyer_label);
+    let note = optional_text(p.note);
 
     let now = Utc::now().timestamp();
 
     let row = sqlx::query(
         "INSERT INTO public.commission_release_entries (
             project_id, subject_agent_id, period_start, period_end,
-            amount, paid_at, created_at, share_kind
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            amount, paid_at, created_at, share_kind, row_key, buyer_label, note
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING id, project_id, subject_agent_id, period_start, period_end,
-                amount, paid_at, created_at, share_kind",
+                amount, paid_at, created_at, share_kind, row_key, buyer_label, note",
     )
     .bind(project_id)
     .bind(subject)
@@ -225,6 +254,9 @@ pub async fn create_commission_release_entry(
     .bind(paid_at)
     .bind(now)
     .bind(&share_kind)
+    .bind(&row_key)
+    .bind(&buyer_label)
+    .bind(&note)
     .fetch_one(&pool)
     .await
     .map_err(|e| {
